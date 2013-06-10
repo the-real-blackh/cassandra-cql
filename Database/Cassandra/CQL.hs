@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving, ScopedTypeVariables,
         FlexibleInstances, DeriveDataTypeable, UndecidableInstances,
-        BangPatterns, OverlappingInstances, EmptyDataDecls #-}
+        BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures #-}
 module Database.Cassandra.CQL (
         -- * Initialization
         Server,
@@ -25,9 +25,7 @@ module Database.Cassandra.CQL (
         -- * Queries
         Query,
         query,
-        Rows,
-        Write,
-        Schema,
+        Style(..),
         -- * Operations
         execute,
         executeWrite,
@@ -411,7 +409,7 @@ introduce pool = do
         ERROR -> throwError (frBody fr)
         op -> throw $ LocalProtocolError $ "introduce: unexpected opcode " `T.append` T.pack (show op)
     let Keyspace ksName = piKeyspace pool
-    let q = query $ "USE " `T.append` ksName :: Query Rows () () 
+    let q = query $ "USE " `T.append` ksName :: Query Rows () 
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
@@ -562,23 +560,16 @@ newtype PreparedQueryID = PreparedQueryID ByteString
 newtype QueryID = QueryID (Digest SHA1)
     deriving (Eq, Ord, Show)
 
--- | A style for use with 'Query': a query that returns rows
-data Rows
+data Style = Rows | Write | Schema
 
--- | A style for use with 'Query': a query that returns void 
-data Write
+data Query :: Style -> * -> * where
+    Query :: QueryID -> Text -> Query style values
+    deriving Show
 
--- | A style for use with 'Query': a query that changes the schema, such as
--- creating or dropping a table
-data Schema
-
-data Query style i o = Query QueryID Text
-    deriving Show  -- to do: How to do this with DataKinds?
-
-instance IsString (Query style i o) where
+instance IsString (Query style values) where
     fromString = query . T.pack
 
-query :: Text -> Query style i o
+query :: Text -> Query style values
 query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
 
 data PreparedQuery = PreparedQuery PreparedQueryID Metadata
@@ -632,7 +623,7 @@ instance ProtoElt (Result [ByteString]) where
             0x0005 -> SchemaChange <$> getElt <*> getElt <*> getElt
             _ -> fail $ "bad result kind: 0x"++showHex kind ""
 
-prepare :: Query style i o -> StateT ActiveSession IO PreparedQuery
+prepare :: Query style values -> StateT ActiveSession IO PreparedQuery
 prepare (Query qid cql) = do
     cache <- gets actQueryCache
     case qid `M.lookup` cache of
@@ -876,12 +867,12 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
-executeRaw :: (MonadCassandra m, CasValues i) =>
-              Query style i o -> i -> Consistency -> m (Result [ByteString])
+executeRaw :: (MonadCassandra m, CasValues values) =>
+              Query style ignored -> values -> Consistency -> m (Result [ByteString])
 executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
 
-executeInternal :: CasValues i =>
-                   Query style i o -> i -> Consistency -> StateT ActiveSession IO (Result [ByteString])
+executeInternal :: CasValues values =>
+                   Query style ignored -> values -> Consistency -> StateT ActiveSession IO (Result [ByteString])
 executeInternal query i cons = do
     pq@(PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
@@ -899,16 +890,16 @@ executeInternal query i cons = do
         _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 -- | Execute a query that returns rows
-execute :: (MonadCassandra m, CasValues i, CasValues o) =>
-           Query Rows i o -> i -> Consistency -> m [o]
-execute q i cons = do
-    res <- executeRaw q i cons
+execute :: (MonadCassandra m, CasValues values) =>
+           Query Rows values -> Consistency -> m [values]
+execute q cons = do
+    res <- executeRaw q () cons
     case res of
         RowsResult meta rows -> decodeRows meta rows
         _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
                               `T.append` " for query: " `T.append` T.pack (show q)
 
-decodeRows :: (MonadCatchIO m, CasValues o) => Metadata -> [[ByteString]] -> m [o]
+decodeRows :: (MonadCatchIO m, CasValues values) => Metadata -> [[ByteString]] -> m [values]
 decodeRows meta rows0 = do
     let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
     case lefts rows1 of
@@ -918,8 +909,8 @@ decodeRows meta rows0 = do
     return $ rows2
 
 -- | Execute a write operation that returns void
-executeWrite :: (MonadCassandra m, CasValues i) =>
-                Query Write i () -> i -> Consistency -> m ()
+executeWrite :: (MonadCassandra m, CasValues values) =>
+                Query Write values -> values -> Consistency -> m ()
 executeWrite q i cons = do
     res <- executeRaw q i cons
     case res of
@@ -928,8 +919,8 @@ executeWrite q i cons = do
                               `T.append` " for query: " `T.append` T.pack (show q)
 
 -- | Execute a schema change, such as creating or dropping a table.
-executeSchema :: (MonadCassandra m, CasValues i) =>
-                 Query Schema i () -> i -> Consistency -> m (Change, Keyspace, Table)
+executeSchema :: (MonadCassandra m, CasValues values) =>
+                 Query Schema values -> values -> Consistency -> m (Change, Keyspace, Table)
 executeSchema q i cons = do
     res <- executeRaw q i cons
     case res of
