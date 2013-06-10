@@ -28,6 +28,10 @@ getOneSong :: Query Rows UUID (Text, Int)
 getOneSong = "select artist, timesPlayed from songs where id=?"
 
 main = do
+    {-
+    Assuming a 'test' keyspace already exists. Here's some CQL to create it:
+    CREATE KEYSPACE test WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : '1' };
+    -}
     pool <- createCassandraPool [("localhost", "9042")] "test" -- servers, keyspace
     runCas pool $ do
         do
