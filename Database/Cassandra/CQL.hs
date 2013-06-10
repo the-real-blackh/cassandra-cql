@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving, ScopedTypeVariables,
         FlexibleInstances, DeriveDataTypeable, UndecidableInstances,
-        BangPatterns, OverlappingInstances #-}
+        BangPatterns, OverlappingInstances, EmptyDataDecls #-}
 module Database.Cassandra.CQL (
         -- * Initialization
         Server,
@@ -19,11 +19,15 @@ module Database.Cassandra.CQL (
         ColumnSpec(..),
         Metadata(..),
         CType(..),
-        Query,
-        query,
         Change(..),
         Table(..),
         Consistency(..),
+        -- * Queries
+        Query,
+        query,
+        Rows,
+        Write,
+        Schema,
         -- * Operations
         execute,
         executeWrite,
@@ -407,7 +411,7 @@ introduce pool = do
         ERROR -> throwError (frBody fr)
         op -> throw $ LocalProtocolError $ "introduce: unexpected opcode " `T.append` T.pack (show op)
     let Keyspace ksName = piKeyspace pool
-    let q = query $ "USE " `T.append` ksName :: Query () () 
+    let q = query $ "USE " `T.append` ksName :: Query Rows () () 
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
@@ -558,12 +562,23 @@ newtype PreparedQueryID = PreparedQueryID ByteString
 newtype QueryID = QueryID (Digest SHA1)
     deriving (Eq, Ord, Show)
 
-data Query i o = Query QueryID Text deriving Show
+-- | A style for use with 'Query': a query that returns rows
+data Rows
 
-instance IsString (Query i o) where
+-- | A style for use with 'Query': a query that returns void 
+data Write
+
+-- | A style for use with 'Query': a query that changes the schema, such as
+-- creating or dropping a table
+data Schema
+
+data Query style i o = Query QueryID Text
+    deriving Show  -- to do: How to do this with DataKinds?
+
+instance IsString (Query style i o) where
     fromString = query . T.pack
 
-query :: Text -> Query i o
+query :: Text -> Query style i o
 query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
 
 data PreparedQuery = PreparedQuery PreparedQueryID Metadata
@@ -583,22 +598,22 @@ instance ProtoElt Change where
             _ -> fail $ "unexpected change string: "++show str
 
 data Result vs = Void
-            | Rows Metadata [vs]
-            | SetKeyspace Text
-            | Prepared PreparedQueryID Metadata
-            | SchemaChange Change Keyspace Table
+               | RowsResult Metadata [vs]
+               | SetKeyspace Text
+               | Prepared PreparedQueryID Metadata
+               | SchemaChange Change Keyspace Table
     deriving Show
 
 instance Functor Result where
     f `fmap` Void = Void
-    f `fmap` Rows meta rows = Rows meta (f `fmap` rows)
+    f `fmap` RowsResult meta rows = RowsResult meta (f `fmap` rows)
     f `fmap` SetKeyspace ks = SetKeyspace ks
     f `fmap` Prepared pqid meta = Prepared pqid meta
     f `fmap` SchemaChange ch ks t = SchemaChange ch ks t
 
 instance Foldable Result where
-    foldr f z (Rows _ rows) = foldr f z rows
-    foldr _ z _             = z
+    foldr f z (RowsResult _ rows) = foldr f z rows
+    foldr _ z _                   = z
 
 instance ProtoElt (Result [ByteString]) where
     putElt _ = error "formatting RESULT is not implemented"
@@ -611,13 +626,13 @@ instance ProtoElt (Result [ByteString]) where
                 let colCount = length colSpecs
                 rowCount <- fromIntegral <$> getWord32be
                 rows <- replicateM rowCount (replicateM colCount (unLong <$> getElt))
-                return $ Rows meta rows
+                return $ RowsResult meta rows
             0x0003 -> SetKeyspace <$> getElt
             0x0004 -> Prepared <$> getElt <*> getElt
             0x0005 -> SchemaChange <$> getElt <*> getElt <*> getElt
             _ -> fail $ "bad result kind: 0x"++showHex kind ""
 
-prepare :: Query i o -> StateT ActiveSession IO PreparedQuery
+prepare :: Query style i o -> StateT ActiveSession IO PreparedQuery
 prepare (Query qid cql) = do
     cache <- gets actQueryCache
     case qid `M.lookup` cache of
@@ -862,11 +877,11 @@ instance ProtoElt Consistency where
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
 executeRaw :: (MonadCassandra m, CasValues i) =>
-           Query i o -> i -> Consistency -> m (Result [ByteString])
+              Query style i o -> i -> Consistency -> m (Result [ByteString])
 executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
 
 executeInternal :: CasValues i =>
-                   Query i o -> i -> Consistency -> StateT ActiveSession IO (Result [ByteString])
+                   Query style i o -> i -> Consistency -> StateT ActiveSession IO (Result [ByteString])
 executeInternal query i cons = do
     pq@(PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
@@ -885,11 +900,11 @@ executeInternal query i cons = do
 
 -- | Execute a query that returns rows
 execute :: (MonadCassandra m, CasValues i, CasValues o) =>
-           Query i o -> i -> Consistency -> m [o]
+           Query Rows i o -> i -> Consistency -> m [o]
 execute q i cons = do
     res <- executeRaw q i cons
     case res of
-        Rows meta rows -> decodeRows meta rows
+        RowsResult meta rows -> decodeRows meta rows
         _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
                               `T.append` " for query: " `T.append` T.pack (show q)
 
@@ -904,7 +919,7 @@ decodeRows meta rows0 = do
 
 -- | Execute a write operation that returns void
 executeWrite :: (MonadCassandra m, CasValues i) =>
-                Query i () -> i -> Consistency -> m ()
+                Query Write i () -> i -> Consistency -> m ()
 executeWrite q i cons = do
     res <- executeRaw q i cons
     case res of
@@ -914,7 +929,7 @@ executeWrite q i cons = do
 
 -- | Execute a schema change, such as creating or dropping a table.
 executeSchema :: (MonadCassandra m, CasValues i) =>
-                 Query i () -> i -> Consistency -> m (Change, Keyspace, Table)
+                 Query Schema i () -> i -> Consistency -> m (Change, Keyspace, Table)
 executeSchema q i cons = do
     res <- executeRaw q i cons
     case res of

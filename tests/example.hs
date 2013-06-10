@@ -6,16 +6,16 @@ import Control.Monad.Trans (liftIO)
 import Data.Int
 import Data.Text (Text)
 
-q2 :: Query () ()
+q2 :: Query Schema () ()
 q2 = "drop table songs"
 
-q3 :: Query () ()
+q3 :: Query Schema () ()
 q3 = "create table songs (title text PRIMARY KEY, artist text)"
 
-q4 :: Query (Text, Text) ()
+q4 :: Query Write (Text, Text) ()
 q4 = "insert into songs (title, artist) values (?, ?)"
 
-q5 :: Query () (Text, Text)
+q5 :: Query Rows () (Text, Text)
 q5 = "select * from songs"
 
 main = do
