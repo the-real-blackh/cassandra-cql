@@ -5,15 +5,16 @@
 --
 -- This module isn't properly documented yet. For now, take a look at tests/example.hs.
 --
--- Not all Cassandra data types supported yet: blanks below have not been implemented.
+-- Credentials are not implemented yet.
 --
--- Correspondence between Haskell and CQL types:
+-- Here's the correspondence between Haskell and CQL types. Not all Cassandra data
+-- types supported as yet: Haskell types listed below have been implemented.
 --
 -- * ascii - 'ByteString'
 --
 -- * bigint - 'Int64'
 --
--- * blob - 'Blob' 'Bytestring'
+-- * blob - 'Blob' 'ByteString'
 --
 -- * boolean - 'Bool'
 --
@@ -41,11 +42,11 @@
 --
 -- * inet
 --
--- * list<type>
+-- * list\<type\>
 --
--- * map<type, type>
+-- * map\<type, type\>
 --
--- * set<type>
+-- * set\<type\>
 --
 module Database.Cassandra.CQL (
         -- * Initialization
@@ -961,8 +962,8 @@ executeInternal query i cons = do
 
 -- | Execute a query that returns rows
 execute :: (MonadCassandra m, CasValues values) =>
-           Query Rows values -> Consistency -> m [values]
-execute q cons = do
+           Consistency -> Query Rows values -> m [values]
+execute cons q = do
     res <- executeRaw q () cons
     case res of
         RowsResult meta rows -> decodeRows meta rows
@@ -980,8 +981,8 @@ decodeRows meta rows0 = do
 
 -- | Execute a write operation that returns void
 executeWrite :: (MonadCassandra m, CasValues values) =>
-                Query Write values -> values -> Consistency -> m ()
-executeWrite q i cons = do
+                Consistency -> Query Write values -> values -> m ()
+executeWrite cons q i = do
     res <- executeRaw q i cons
     case res of
         Void -> return ()
@@ -990,8 +991,8 @@ executeWrite q i cons = do
 
 -- | Execute a schema change, such as creating or dropping a table.
 executeSchema :: (MonadCassandra m, CasValues values) =>
-                 Query Schema values -> values -> Consistency -> m (Change, Keyspace, Table)
-executeSchema q i cons = do
+                 Consistency -> Query Schema values -> values -> m (Change, Keyspace, Table)
+executeSchema cons q i = do
     res <- executeRaw q i cons
     case res of
         SchemaChange ch ks ta -> return (ch, ks, ta)

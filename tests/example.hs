@@ -28,18 +28,21 @@ main = do
     pool <- createCassandraPool [("localhost", "9042")] "meta"
     runCas pool $ do
         do
-            liftIO . print =<< executeSchema dropSongs () QUORUM
+            liftIO . print =<< executeSchema QUORUM dropSongs ()
           `catch` \exc -> case exc of
             ConfigError _ -> return ()  -- Ignore the error if the table doesn't exist
             _             -> liftIO $ throw exc
-        liftIO . print =<< executeSchema createSongs () QUORUM
+
+        liftIO . print =<< executeSchema QUORUM createSongs ()
+
         u1 <- liftIO randomIO
-        executeWrite insertSong (u1, "La Grange", "ZZ Top", False, 2) QUORUM
         u2 <- liftIO randomIO
-        executeWrite insertSong (u2, "Your star", "Evanescence", True, 799) QUORUM
         u3 <- liftIO randomIO
-        executeWrite insertSong (u3, "Angel of Death", "Slayer", False, 50) QUORUM
-        songs <- execute getSongs QUORUM
+        executeWrite QUORUM insertSong (u1, "La Grange", "ZZ Top", False, 2)
+        executeWrite QUORUM insertSong (u2, "Your star", "Evanescence", True, 799)
+        executeWrite QUORUM insertSong (u3, "Angel of Death", "Slayer", False, 50)
+
+        songs <- execute QUORUM getSongs
         liftIO $ forM_ songs $ \(uuid, title, artist, female, played) -> do
             putStrLn ""
             putStrLn $ "uuid          : "++show uuid
