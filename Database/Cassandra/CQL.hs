@@ -19,13 +19,12 @@ module Database.Cassandra.CQL (
         Metadata(..),
         CType(..),
         Row(..),
-        Query(..),
-        QueryID(..),
+        Query,
+        query,
         Change(..),
         Table(..),
         Consistency(..),
         -- * Operations
-        prepare,
         execute,
         -- * Value types
         CasType(..),
@@ -36,22 +35,25 @@ module Database.Cassandra.CQL (
 import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception
+import Control.Exception (IOException, SomeException)
+import Control.Monad.CatchIO
 import Control.Monad.Maybe
 import Control.Monad.Reader
+import Control.Monad.State hiding (get, put)
+import qualified Control.Monad.State as State
 import Control.Monad.Trans
+import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C  -- ###
-import Text.Hexdump  -- ###
 import Data.Int
 import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
+import Data.Maybe
 import Data.Word
 import Data.Typeable
-import Data.IORef
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
@@ -66,32 +68,34 @@ import Numeric
 
 type Server = (HostName, ServiceName)
 
+data ActiveSession = ActiveSession {
+        actSocket     :: Socket,
+        actQueryCache :: Map QueryID PreparedQuery
+    }
+
 data Session = Session {
         sesServer :: Server,
-        sesSocket :: Maybe Socket
+        sesActive :: Maybe ActiveSession
     }
 
 data CPool = CPool {
         piKeyspace :: Keyspace,
-        piSessions :: TVar (Seq (IORef Session))
+        piSessions :: TVar (Seq Session)
     }
 
-class MonadIO m => MonadCassandra m where
+class MonadCatchIO m => MonadCassandra m where
     getEltsandraPool :: m CPool
 
 createCassandraPool :: [Server] -> Keyspace -> IO CPool
 createCassandraPool svrs ks = do
-    sessions <- forM svrs $ \svr -> newIORef $ Session {
-            sesServer = svr,
-            sesSocket = Nothing
-        }
+    let sessions = map (\svr -> Session svr Nothing) svrs
     sess <- atomically $ newTVar (Seq.fromList sessions)
     return $ CPool {
             piKeyspace = ks,
             piSessions = sess
         }
 
-takeSession :: CPool -> IO (IORef Session)
+takeSession :: CPool -> IO Session
 takeSession pool = atomically $ do
     sess <- readTVar (piSessions pool)
     if Seq.null sess
@@ -101,16 +105,15 @@ takeSession pool = atomically $ do
             writeTVar (piSessions pool) (Seq.drop 1 sess)
             return ses
 
-putSession :: CPool -> IORef Session -> IO ()
+putSession :: CPool -> Session -> IO ()
 putSession pool ses = atomically $ modifyTVar (piSessions pool) (|> ses)
 
-connectIfNeeded :: CPool -> IORef Session -> IO (Maybe Socket)
-connectIfNeeded pool sesRef = do
-    ses <- readIORef sesRef
-    case sesSocket ses of
-        Just socket -> return $ Just socket
-        Nothing -> do
-            let (host, service) = sesServer ses
+connectIfNeeded :: CPool -> Session -> IO Session
+connectIfNeeded pool session =
+    if isJust (sesActive session)
+        then return session
+        else do
+            let (host, service) = sesServer session
             ais <- getAddrInfo Nothing (Just  host) (Just service)
             mSocket <- foldM (\mSocket ai -> do
                     case mSocket of
@@ -126,11 +129,14 @@ connectIfNeeded pool sesRef = do
                 ) Nothing ais
             case mSocket of
                 Just socket -> do
-                    writeIORef sesRef $ ses { sesSocket = Just socket }
-                    introduce pool socket
-                    return $ Just socket
+                    let active = ActiveSession {
+                                actSocket = socket,
+                                actQueryCache = M.empty
+                            }
+                    active' <- execStateT (introduce pool) active
+                    return $ session { sesActive = Just active' }
                 Nothing ->
-                    return Nothing
+                    return session
 
 data Flag = Compression | Tracing
     deriving Show
@@ -199,7 +205,7 @@ data Frame a = Frame {
 recvAll :: Socket -> Int -> IO ByteString
 recvAll s n = do
     bs <- recv s n
-    when (B.null bs) $ throwIO $ LocalProtocolException $ "short read"
+    when (B.null bs) $ throw $ LocalProtocolException $ "short read"
     let left = n - B.length bs
     if left == 0
         then return bs
@@ -210,18 +216,19 @@ recvAll s n = do
 protocolVersion :: Word8
 protocolVersion = 1
 
-recvFrame :: Socket -> IO (Frame ByteString)
-recvFrame s = do
-    hdrBs <- recvAll s 8
+recvFrame :: StateT ActiveSession IO (Frame ByteString)
+recvFrame = do
+    s <- gets actSocket
+    hdrBs <- liftIO $ recvAll s 8
     case runGet parseHeader hdrBs of
-        Left err -> throwIO $ LocalProtocolException $ "recvFrame: " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolException $ "recvFrame: " `T.append` T.pack err
         Right (ver0, flags, stream, opcode, length) -> do
             let ver = ver0 .&. 0x7f
             when (ver /= protocolVersion) $
-                throwIO $ LocalProtocolException $ "unexpected version " `T.append` T.pack (show ver)
+                throw $ LocalProtocolException $ "unexpected version " `T.append` T.pack (show ver)
             body <- if length == 0
                 then pure B.empty
-                else recvAll s (fromIntegral length)
+                else liftIO $ recvAll s (fromIntegral length)
             return $ Frame flags stream opcode body
   where
     parseHeader = do
@@ -232,8 +239,8 @@ recvFrame s = do
         length <- getWord32be
         return (ver, flags, stream, opcode, length)
 
-sendFrame :: Socket -> Frame ByteString -> IO ()
-sendFrame s fr@(Frame flags stream opcode body) = do
+sendFrame :: Frame ByteString -> StateT ActiveSession IO ()
+sendFrame fr@(Frame flags stream opcode body) = do
     let bs = runPut $ do
             putWord8 protocolVersion
             putFlags flags
@@ -242,7 +249,8 @@ sendFrame s fr@(Frame flags stream opcode body) = do
             putWord32be $ fromIntegral $ B.length body
             putByteString body
     -- putStrLn $ hexdump 0 (C.unpack bs)
-    sendAll s bs
+    s <- gets actSocket
+    liftIO $ sendAll s bs
 
 class ProtoElt a where
     getElt :: Get a
@@ -268,7 +276,7 @@ decodeCas bs = runGet getCas bs
 decodeEltM :: (ProtoElt a, MonadIO m) => Text -> ByteString -> m a
 decodeEltM what bs =
     case decodeElt bs of
-        Left err -> liftIO $ throwIO $ LocalProtocolException $
+        Left err -> throw $ LocalProtocolException $
             "can't parse" `T.append` what `T.append` ": " `T.append` T.pack err
         Right res -> return res
 
@@ -340,16 +348,16 @@ data CassandraException = LocalProtocolException Text
                         | Invalid Text
                         | ConfigError Text
                         | AlreadyExists Text Keyspace Table
-                        | Unprepared Text QueryID
+                        | Unprepared Text PreparedQueryID
     deriving (Show, Typeable)
 
 instance Exception CassandraException where
 
-throwError :: ByteString -> IO a
+throwError :: MonadCatchIO m => ByteString -> m a
 throwError bs = do
     case runGet parseError bs of
-        Left err -> throwIO $ LocalProtocolException $ "failed to parse error: " `T.append` T.pack err
-        Right exc -> throwIO exc
+        Left err -> throw $ LocalProtocolException $ "failed to parse error: " `T.append` T.pack err
+        Right exc -> throw exc
   where
     parseError :: Get CassandraException
     parseError = do
@@ -380,26 +388,39 @@ throwError bs = do
             0x2500 -> Unprepared <$> getElt <*> getElt
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
-introduce :: CPool -> Socket -> IO ()
-introduce pool s = do
-    sendFrame s $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
-    fr <- recvFrame s
+introduce :: CPool -> StateT ActiveSession IO ()
+introduce pool = do
+    sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
+    fr <- recvFrame
     case frOpcode fr of
-        AUTHENTICATE -> throwIO $ AuthenticationException "authentication not implemented yet"
+        AUTHENTICATE -> throw $ AuthenticationException "authentication not implemented yet"
         READY -> return ()
         ERROR -> throwError (frBody fr)
-        op -> throwIO $ LocalProtocolException $ "introduce: unexpected opcode " `T.append` T.pack (show op)
+        op -> throw $ LocalProtocolException $ "introduce: unexpected opcode " `T.append` T.pack (show op)
 
-withSession :: MonadCassandra m => (CPool -> Socket -> IO a) -> m a
+withSession :: MonadCassandra m => (CPool -> StateT ActiveSession IO a) -> m a
 withSession code = do
     pool <- getEltsandraPool
-    mA <- liftIO $ bracket (takeSession pool) (putSession pool) $ \sesRef -> do
-        mSocket <- connectIfNeeded pool sesRef
-        case mSocket of
-            Just socket -> do
-                a <- code pool socket
+    mA <- liftIO $ do
+        session <- connectIfNeeded pool =<< takeSession pool
+        case sesActive session of
+            Just active -> do
+                (a, active') <- runStateT (code pool) active
+                putSession pool $ session { sesActive = Just active' }
                 return (Just a)
-            Nothing -> return Nothing
+              `catches` [
+                -- Close the session if we get any IOException
+                Handler $ \(exc :: IOException) -> do
+                    sClose (actSocket active)
+                    putSession pool $ session { sesActive = Nothing }
+                    throw exc,
+                Handler $ \(exc :: SomeException) -> do
+                    putSession pool session
+                    throw exc
+              ]
+            Nothing -> do
+                putSession pool session
+                return Nothing
     case mA of
         Just a -> return a
         Nothing -> withSession code  -- Try again until we succeed
@@ -517,10 +538,21 @@ instance ProtoElt Metadata where
 newtype Row = Row [ByteString]
     deriving Show
 
-newtype QueryID = QueryID ByteString
+newtype PreparedQueryID = PreparedQueryID ByteString
     deriving (Eq, Ord, Show, ProtoElt)
 
-data Query = Query QueryID Metadata
+newtype QueryID = QueryID (Digest SHA1)
+    deriving (Eq, Ord, Show)
+
+data Query vs = Query QueryID Text deriving Show
+
+instance IsString (Query vs) where
+    fromString = query . T.pack
+
+query :: Text -> Query vs
+query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
+
+data PreparedQuery = PreparedQuery PreparedQueryID Metadata
     deriving Show
 
 data Change = CREATED | UPDATED | DROPPED
@@ -539,7 +571,7 @@ instance ProtoElt Change where
 data Result = Void
             | Rows Metadata [Row]
             | SetKeyspace Text
-            | Prepared QueryID Metadata
+            | Prepared PreparedQueryID Metadata
             | SchemaChange Change Keyspace Table
     deriving Show
 
@@ -560,17 +592,24 @@ instance ProtoElt Result where
             0x0005 -> SchemaChange <$> getElt <*> getElt <*> getElt
             _ -> fail $ "bad result kind: 0x"++showHex kind ""
 
-prepare :: MonadCassandra m => Text -> m Query
-prepare cql = withSession $ \pool s -> do
-    sendFrame s $ Frame [] 0 PREPARE $ encodeElt (Long cql)
-    fr <- recvFrame s
-    case frOpcode fr of
-        RESULT -> do
-            res <- decodeEltM "RESULT" (frBody fr)
-            case res of
-                Prepared qid meta -> return $ Query qid meta
-                _ -> throwIO $ LocalProtocolException $ "prepare: unexpected result " `T.append` T.pack (show res)
-        _ -> throwIO $ LocalProtocolException $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+prepare :: Query vs -> StateT ActiveSession IO PreparedQuery
+prepare (Query qid cql) = do
+    cache <- gets actQueryCache
+    case qid `M.lookup` cache of
+        Just pq -> return pq
+        Nothing -> do
+            sendFrame $ Frame [] 0 PREPARE $ encodeElt (Long cql)
+            fr <- recvFrame
+            case frOpcode fr of
+                RESULT -> do
+                    res <- decodeEltM "RESULT" (frBody fr)
+                    case res of
+                        Prepared pqid meta -> do
+                            let pq = PreparedQuery pqid meta
+                            modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
+                            return pq
+                        _ -> throw $ LocalProtocolException $ "prepare: unexpected result " `T.append` T.pack (show res)
+                _ -> throw $ LocalProtocolException $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 data CodingFailure = Mismatch Int CType CType
                    | TooMany Int Int
@@ -654,26 +693,27 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
-execute :: (MonadCassandra m, CasValues vs) => Query -> vs -> Consistency -> m Result
-execute (Query qid (Metadata colspecs)) vs cons = withSession $ \pool s -> do
+execute :: (MonadCassandra m, CasValues vs) => Query vs -> vs -> Consistency -> m Result
+execute query vs cons = withSession $ \pool -> do
+    pq@(PreparedQuery pqid (Metadata colspecs)) <- prepare query
     let bss = encodeValues vs
     values <- case encodeValues vs (map (\(ColumnSpec _ _ typ) -> typ) colspecs) of
-        Left err -> throwIO $ DataCodingException $ T.pack $ show err
+        Left err -> throw $ DataCodingException $ T.pack $ show err
         Right values -> return values
-    print values
-    sendFrame s $ Frame [] 0 EXECUTE $ runPut $ do
-        putElt qid
+    liftIO $ print values  -- ###
+    sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
+        putElt pqid
         putWord16be (fromIntegral $ length values)
         mapM_ putCas values
         putElt cons
-    fr <- recvFrame s
+    fr <- recvFrame
     case frOpcode fr of
         RESULT -> decodeEltM "RESULT" (frBody fr)
         ERROR -> throwError (frBody fr)
-        _ -> throwIO $ LocalProtocolException $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+        _ -> throw $ LocalProtocolException $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 newtype Cas a = Cas (ReaderT CPool IO a)
-    deriving (Functor, Applicative, Monad, MonadIO)
+    deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
 
 instance MonadCassandra Cas where
     getEltsandraPool = Cas ask

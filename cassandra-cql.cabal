@@ -1,0 +1,32 @@
+name:                cassandra-cql
+version:             0.0.0.1
+synopsis:            Haskell client for Cassandra's CQL protocol
+description:         
+  Haskell client for Cassandra's CQL protocol
+license:             BSD3
+license-file:        LICENSE
+author:              Stephen Blackheath
+maintainer:          http://blacksapphire.com/antispam/
+copyright:           (c) Stephen Blackheath 2013
+category:            Database
+build-type:          Simple
+cabal-version:       >=1.8
+extra-source-files:  tests/example.hs
+
+source-repository head
+  type:     git
+  location: https://github.com/the-real-blackh/cassandra-cql
+
+library
+  exposed-modules:     Database.Cassandra.CQL
+  build-depends:       base             >= 4.5.0.0 && < 4.7.0.0,
+                       containers       >= 0.4.0.0,
+                       mtl              >= 2.1.0,
+                       MonadCatchIO-mtl >= 0.3.0.0,
+                       network          >= 2.4.0.0,
+                       text             >= 0.11.0.0,
+                       cereal           >= 0.3.0.0,
+                       bytestring       >= 0.10.0.0,
+                       cryptohash       >= 0.9.0,
+                       MaybeT           >= 0.1.0,
+                       stm              >= 2.4.0
