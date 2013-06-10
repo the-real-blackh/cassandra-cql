@@ -14,7 +14,7 @@
 --
 -- * bigint - 'Int64'
 --
--- * blob - 'Blob' 'ByteString'
+-- * blob - 'Blob'
 --
 -- * boolean - 'Bool'
 --
