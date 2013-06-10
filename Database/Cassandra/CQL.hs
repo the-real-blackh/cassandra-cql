@@ -11,6 +11,7 @@ module Database.Cassandra.CQL (
         Cas,
         runCas,
         CassandraException(..),
+        TransportDirection(..),
         -- * Type used in operations
         Keyspace(..),
         Result(..),
@@ -18,7 +19,6 @@ module Database.Cassandra.CQL (
         ColumnSpec(..),
         Metadata(..),
         CType(..),
-        Row(..),
         Query,
         query,
         Change(..),
@@ -26,10 +26,14 @@ module Database.Cassandra.CQL (
         Consistency(..),
         -- * Operations
         execute,
+        executeWrite,
+        executeSchema,
+        executeRaw,
         -- * Value types
         CasType(..),
         CasValues(..),
-        Blob(..)
+        Blob(..),
+        metadataTypes
     ) where
 
 import Control.Applicative
@@ -46,9 +50,10 @@ import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Char8 as C  -- ###
+import Data.Either (lefts)
+import Data.Foldable (Foldable(..))
+import qualified Data.Foldable as Foldable
 import Data.Int
-import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
@@ -65,6 +70,7 @@ import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrI
     connect, sClose)
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
+import Prelude hiding (foldr)
 
 type Server = (HostName, ServiceName)
 
@@ -205,7 +211,7 @@ data Frame a = Frame {
 recvAll :: Socket -> Int -> IO ByteString
 recvAll s n = do
     bs <- recv s n
-    when (B.null bs) $ throw $ LocalProtocolException $ "short read"
+    when (B.null bs) $ throw $ LocalProtocolError $ "short read"
     let left = n - B.length bs
     if left == 0
         then return bs
@@ -221,11 +227,11 @@ recvFrame = do
     s <- gets actSocket
     hdrBs <- liftIO $ recvAll s 8
     case runGet parseHeader hdrBs of
-        Left err -> throw $ LocalProtocolException $ "recvFrame: " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolError $ "recvFrame: " `T.append` T.pack err
         Right (ver0, flags, stream, opcode, length) -> do
             let ver = ver0 .&. 0x7f
             when (ver /= protocolVersion) $
-                throw $ LocalProtocolException $ "unexpected version " `T.append` T.pack (show ver)
+                throw $ LocalProtocolError $ "unexpected version " `T.append` T.pack (show ver)
             body <- if length == 0
                 then pure B.empty
                 else liftIO $ recvAll s (fromIntegral length)
@@ -276,7 +282,7 @@ decodeCas bs = runGet getCas bs
 decodeEltM :: (ProtoElt a, MonadIO m) => Text -> ByteString -> m a
 decodeEltM what bs =
     case decodeElt bs of
-        Left err -> throw $ LocalProtocolException $
+        Left err -> throw $ LocalProtocolError $
             "can't parse" `T.append` what `T.append` ": " `T.append` T.pack err
         Right res -> return res
 
@@ -331,9 +337,12 @@ instance ProtoElt (Long ByteString) where
         len <- getWord32be
         Long <$> getByteString (fromIntegral len)
 
-data CassandraException = LocalProtocolException Text
+data TransportDirection = TransportSending | TransportReceiving
+    deriving Show
+
+data CassandraException = LocalProtocolError Text
                         | AuthenticationException Text
-                        | DataCodingException Text
+                        | ValueMarshallingException TransportDirection Text
                         | ServerError Text
                         | ProtocolError Text
                         | BadCredentials Text
@@ -356,7 +365,7 @@ instance Exception CassandraException where
 throwError :: MonadCatchIO m => ByteString -> m a
 throwError bs = do
     case runGet parseError bs of
-        Left err -> throw $ LocalProtocolException $ "failed to parse error: " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolError $ "failed to parse error: " `T.append` T.pack err
         Right exc -> throw exc
   where
     parseError :: Get CassandraException
@@ -396,7 +405,14 @@ introduce pool = do
         AUTHENTICATE -> throw $ AuthenticationException "authentication not implemented yet"
         READY -> return ()
         ERROR -> throwError (frBody fr)
-        op -> throw $ LocalProtocolException $ "introduce: unexpected opcode " `T.append` T.pack (show op)
+        op -> throw $ LocalProtocolError $ "introduce: unexpected opcode " `T.append` T.pack (show op)
+    let Keyspace ksName = piKeyspace pool
+    let q = query $ "USE " `T.append` ksName :: Query () () 
+    res <- executeInternal q () ONE
+    case res of
+        SetKeyspace ks -> return ()
+        _ -> throw $ ProtocolError $ "expected SetKeyspace, but got " `T.append` T.pack (show res)
+                              `T.append` " for query: " `T.append` T.pack (show q)
 
 withSession :: MonadCassandra m => (CPool -> StateT ActiveSession IO a) -> m a
 withSession code = do
@@ -520,6 +536,7 @@ instance ProtoElt CType where
             0x0020 -> CList <$> getElt
             0x0021 -> CMap <$> getElt <*> getElt
             0x0022 -> CSet <$> getElt
+            _      -> fail $ "unknown data type code 0x"++showHex op ""
 
 instance ProtoElt Metadata where
     putElt _ = error "formatting Metadata is not implemented"
@@ -535,21 +552,18 @@ instance ProtoElt Metadata where
             ColumnSpec tSpec <$> getElt <*> getElt
         return $ Metadata cols
 
-newtype Row = Row [ByteString]
-    deriving Show
-
 newtype PreparedQueryID = PreparedQueryID ByteString
     deriving (Eq, Ord, Show, ProtoElt)
 
 newtype QueryID = QueryID (Digest SHA1)
     deriving (Eq, Ord, Show)
 
-data Query vs = Query QueryID Text deriving Show
+data Query i o = Query QueryID Text deriving Show
 
-instance IsString (Query vs) where
+instance IsString (Query i o) where
     fromString = query . T.pack
 
-query :: Text -> Query vs
+query :: Text -> Query i o
 query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
 
 data PreparedQuery = PreparedQuery PreparedQueryID Metadata
@@ -568,14 +582,25 @@ instance ProtoElt Change where
             "DROPPED" -> pure DROPPED
             _ -> fail $ "unexpected change string: "++show str
 
-data Result = Void
-            | Rows Metadata [Row]
+data Result vs = Void
+            | Rows Metadata [vs]
             | SetKeyspace Text
             | Prepared PreparedQueryID Metadata
             | SchemaChange Change Keyspace Table
     deriving Show
 
-instance ProtoElt Result where
+instance Functor Result where
+    f `fmap` Void = Void
+    f `fmap` Rows meta rows = Rows meta (f `fmap` rows)
+    f `fmap` SetKeyspace ks = SetKeyspace ks
+    f `fmap` Prepared pqid meta = Prepared pqid meta
+    f `fmap` SchemaChange ch ks t = SchemaChange ch ks t
+
+instance Foldable Result where
+    foldr f z (Rows _ rows) = foldr f z rows
+    foldr _ z _             = z
+
+instance ProtoElt (Result [ByteString]) where
     putElt _ = error "formatting RESULT is not implemented"
     getElt = do
         kind <- getWord32be
@@ -585,14 +610,14 @@ instance ProtoElt Result where
                 meta@(Metadata colSpecs) <- getElt
                 let colCount = length colSpecs
                 rowCount <- fromIntegral <$> getWord32be
-                rows <- replicateM rowCount (Row <$> replicateM colCount (unLong <$> getElt))
+                rows <- replicateM rowCount (replicateM colCount (unLong <$> getElt))
                 return $ Rows meta rows
             0x0003 -> SetKeyspace <$> getElt
             0x0004 -> Prepared <$> getElt <*> getElt
             0x0005 -> SchemaChange <$> getElt <*> getElt <*> getElt
             _ -> fail $ "bad result kind: 0x"++showHex kind ""
 
-prepare :: Query vs -> StateT ActiveSession IO PreparedQuery
+prepare :: Query i o -> StateT ActiveSession IO PreparedQuery
 prepare (Query qid cql) = do
     cache <- gets actQueryCache
     case qid `M.lookup` cache of
@@ -603,23 +628,21 @@ prepare (Query qid cql) = do
             case frOpcode fr of
                 RESULT -> do
                     res <- decodeEltM "RESULT" (frBody fr)
-                    case res of
+                    case (res :: Result [ByteString]) of
                         Prepared pqid meta -> do
                             let pq = PreparedQuery pqid meta
                             modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
                             return pq
-                        _ -> throw $ LocalProtocolException $ "prepare: unexpected result " `T.append` T.pack (show res)
-                _ -> throw $ LocalProtocolException $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+                        _ -> throw $ LocalProtocolError $ "prepare: unexpected result " `T.append` T.pack (show res)
+                _ -> throw $ LocalProtocolError $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 data CodingFailure = Mismatch Int CType CType
-                   | TooMany Int Int
-                   | NotEnough Int Int
+                   | WrongNumber Int Int
                    | DecodeFailure Int String
 
 instance Show CodingFailure where
-    show (Mismatch i t1 t2)    = "value index "++show (i+1)++" expected type "++show t1++", got "++show t2
-    show (TooMany i1 i2)       = "too many values, expected "++show i1++" but got "++show i2
-    show (NotEnough i1 i2)     = "not enough values, expected "++show i1++" but got "++show i2
+    show (Mismatch i t1 t2)    = "at value index "++show (i+1)++", Haskell type specifies "++show t1++", but database metadata says "++show t2
+    show (WrongNumber i1 i2)   = "wrong number of values: Haskell type specifies "++show i1++" but database metadata says "++show i2
     show (DecodeFailure i why) = "failed to decode value index "++show (i+1)++": "++why
 
 class CasNested v where
@@ -629,27 +652,29 @@ class CasNested v where
 
 instance CasNested () where
     encodeNested !i () [] = Right []
-    encodeNested !i () ts = Left $ TooMany i (i + length ts)
+    encodeNested !i () ts = Left $ WrongNumber i (i + length ts)
     decodeNested !i []    = Right ()
-    decodeNested !i vs    = Left $ TooMany (i + length vs) i
-    countNested ()        = 0
+    decodeNested !i vs    = Left $ WrongNumber i (i + length vs)
+    countNested _         = 0
 
 instance (CasType a, CasNested rem) => CasNested (a, rem) where
     encodeNested !i (a, rem) (ta:trem) | ta == casType a =
         case encodeNested (i+1) rem trem of
             Left err -> Left err
             Right brem -> Right $ encodeCas a : brem
-    encodeNested !i (a, _) (ta:_) = Left $ Mismatch i ta (casType a)
-    encodeNested !i vs      []    = Left $ NotEnough (i + countNested vs) i 
+    encodeNested !i (a, _) (ta:_) = Left $ Mismatch i (casType a) ta
+    encodeNested !i vs      []    = Left $ WrongNumber (i + countNested vs) i 
     decodeNested !i ((ta, ba):rem) | ta == casType (undefined :: a) =
         case decodeCas ba of
             Left err -> Left $ DecodeFailure i err
             Right a ->
                 case decodeNested (i+1) rem of
                     Left err -> Left err
-                    Right arem -> Right (a, arem)  
-    countNested (_, rem) = let n = 1 + countNested rem 
-                           in  seq n n
+                    Right arem -> Right (a, arem)
+    decodeNested !i ((ta, _):rem) = Left $ Mismatch i (casType (undefined :: a)) ta
+    decodeNested !i []            = Left $ WrongNumber (i + 1 + countNested (undefined :: rem)) i
+    countNested _ = let n = 1 + countNested (undefined :: rem) 
+                    in  seq n n
 
 class CasValues v where
     encodeValues :: v -> [CType] -> Either CodingFailure [ByteString]
@@ -666,6 +691,149 @@ instance CasType a => CasValues a where
 instance (CasType a, CasType b) => CasValues (a, b) where
     encodeValues (a, b) = encodeNested 0 (a, (b, ()))
     decodeValues vs = (\(a, (b, ())) -> (a, b)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c) => CasValues (a, b, c) where
+    encodeValues (a, b, c) = encodeNested 0 (a, (b, (c, ())))
+    decodeValues vs = (\(a, (b, (c, ()))) -> (a, b, c)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d) => CasValues (a, b, c, d) where
+    encodeValues (a, b, c, d) = encodeNested 0 (a, (b, (c, (d, ()))))
+    decodeValues vs = (\(a, (b, (c, (d, ())))) -> (a, b, c, d)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e) => CasValues (a, b, c, d, e) where
+    encodeValues (a, b, c, d, e) = encodeNested 0 (a, (b, (c, (d, (e, ())))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, ()))))) -> (a, b, c, d, e)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f) => CasValues (a, b, c, d, e, f) where
+    encodeValues (a, b, c, d, e, f) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, ()))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, ())))))) ->
+        (a, b, c, d, e, f)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g) => CasValues (a, b, c, d, e, f, g) where
+    encodeValues (a, b, c, d, e, f, g) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, ())))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, ()))))))) ->
+        (a, b, c, d, e, f, g)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h) => CasValues (a, b, c, d, e, f, g, h) where
+    encodeValues (a, b, c, d, e, f, g, h) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, ()))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, ())))))))) ->
+        (a, b, c, d, e, f, g, h)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i) => CasValues (a, b, c, d, e, f, g, h, i) where
+    encodeValues (a, b, c, d, e, f, g, h, i) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, ())))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, ()))))))))) ->
+        (a, b, c, d, e, f, g, h, i)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j)
+              => CasValues (a, b, c, d, e, f, g, h, i, j) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, ()))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, ())))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, ())))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, ()))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, ()))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, ())))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, ())))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, ()))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, ()))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, ())))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, ())))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, ()))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, ()))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, ())))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, ())))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, ()))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, ()))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, ())))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, ())))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, ()))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, ()))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, ())))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)) <$> decodeNested 0 vs
 
 data Consistency = ANY | ONE | TWO | THREE | QUORUM | ALL | LOCAL_QUORUM | EACH_QUORUM
     deriving (Eq, Ord, Show, Bounded, Enum)
@@ -693,14 +861,17 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
-execute :: (MonadCassandra m, CasValues vs) => Query vs -> vs -> Consistency -> m Result
-execute query vs cons = withSession $ \pool -> do
-    pq@(PreparedQuery pqid (Metadata colspecs)) <- prepare query
-    let bss = encodeValues vs
-    values <- case encodeValues vs (map (\(ColumnSpec _ _ typ) -> typ) colspecs) of
-        Left err -> throw $ DataCodingException $ T.pack $ show err
+executeRaw :: (MonadCassandra m, CasValues i) =>
+           Query i o -> i -> Consistency -> m (Result [ByteString])
+executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
+
+executeInternal :: CasValues i =>
+                   Query i o -> i -> Consistency -> StateT ActiveSession IO (Result [ByteString])
+executeInternal query i cons = do
+    pq@(PreparedQuery pqid queryMeta) <- prepare query
+    values <- case encodeValues i (metadataTypes queryMeta) of
+        Left err -> throw $ ValueMarshallingException TransportSending $ T.pack $ show err
         Right values -> return values
-    liftIO $ print values  -- ###
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
         putWord16be (fromIntegral $ length values)
@@ -710,7 +881,49 @@ execute query vs cons = withSession $ \pool -> do
     case frOpcode fr of
         RESULT -> decodeEltM "RESULT" (frBody fr)
         ERROR -> throwError (frBody fr)
-        _ -> throw $ LocalProtocolException $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+        _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+
+-- | Execute a query that returns rows
+execute :: (MonadCassandra m, CasValues i, CasValues o) =>
+           Query i o -> i -> Consistency -> m [o]
+execute q i cons = do
+    res <- executeRaw q i cons
+    case res of
+        Rows meta rows -> decodeRows meta rows
+        _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
+                              `T.append` " for query: " `T.append` T.pack (show q)
+
+decodeRows :: (MonadCatchIO m, CasValues o) => Metadata -> [[ByteString]] -> m [o]
+decodeRows meta rows0 = do
+    let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
+    case lefts rows1 of
+        (err:_) -> throw $ ValueMarshallingException TransportReceiving $ T.pack $ show err
+        [] -> return ()
+    let rows2 = flip map rows1 $ \(Right v) -> v
+    return $ rows2
+
+-- | Execute a write operation that returns void
+executeWrite :: (MonadCassandra m, CasValues i) =>
+                Query i () -> i -> Consistency -> m ()
+executeWrite q i cons = do
+    res <- executeRaw q i cons
+    case res of
+        Void -> return ()
+        _ -> throw $ ProtocolError $ "expected Void, but got " `T.append` T.pack (show res)
+                              `T.append` " for query: " `T.append` T.pack (show q)
+
+-- | Execute a schema change, such as creating or dropping a table.
+executeSchema :: (MonadCassandra m, CasValues i) =>
+                 Query i () -> i -> Consistency -> m (Change, Keyspace, Table)
+executeSchema q i cons = do
+    res <- executeRaw q i cons
+    case res of
+        SchemaChange ch ks ta -> return (ch, ks, ta)
+        _ -> throw $ ProtocolError $ "expected SchemaChange, but got " `T.append` T.pack (show res)
+                              `T.append` " for query: " `T.append` T.pack (show q)
+
+metadataTypes :: Metadata -> [CType]
+metadataTypes (Metadata colspecs) = map (\(ColumnSpec _ _ typ) -> typ) colspecs
 
 newtype Cas a = Cas (ReaderT CPool IO a)
     deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)

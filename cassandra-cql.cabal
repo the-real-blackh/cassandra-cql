@@ -30,3 +30,7 @@ library
                        cryptohash       >= 0.9.0,
                        MaybeT           >= 0.1.0,
                        stm              >= 2.4.0
+  ghc-options:         -Wall -fno-warn-name-shadowing -fno-warn-unused-matches
+                       -fno-warn-missing-signatures -fno-warn-orphans
+                       -fno-warn-unused-imports -fno-warn-unused-binds
+
