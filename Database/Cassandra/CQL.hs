@@ -91,7 +91,6 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException)
 import Control.Monad.CatchIO
-import Control.Monad.Maybe
 import Control.Monad.Reader
 import Control.Monad.State hiding (get, put)
 import qualified Control.Monad.State as State
