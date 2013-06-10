@@ -457,7 +457,7 @@ introduce pool = do
         ERROR -> throwError (frBody fr)
         op -> throw $ LocalProtocolError $ "introduce: unexpected opcode " `T.append` T.pack (show op)
     let Keyspace ksName = piKeyspace pool
-    let q = query $ "USE " `T.append` ksName :: Query Rows () 
+    let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
@@ -632,14 +632,14 @@ newtype QueryID = QueryID (Digest SHA1)
 
 data Style = Rows | Write | Schema
 
-data Query :: Style -> * -> * where
-    Query :: QueryID -> Text -> Query style values
+data Query :: Style -> * -> * -> * where
+    Query :: QueryID -> Text -> Query style i o
     deriving Show
 
-instance IsString (Query style values) where
+instance IsString (Query style i o) where
     fromString = query . T.pack
 
-query :: Text -> Query style values
+query :: Text -> Query style i o
 query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
 
 data PreparedQuery = PreparedQuery PreparedQueryID Metadata
@@ -689,7 +689,7 @@ instance ProtoElt (Result [ByteString]) where
             0x0005 -> SchemaChange <$> getElt <*> getElt <*> getElt
             _ -> fail $ "bad result kind: 0x"++showHex kind ""
 
-prepare :: Query style values -> StateT ActiveSession IO PreparedQuery
+prepare :: Query style i o -> StateT ActiveSession IO PreparedQuery
 prepare (Query qid cql) = do
     cache <- gets actQueryCache
     case qid `M.lookup` cache of
@@ -934,12 +934,12 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
-executeRaw :: (MonadCassandra m, CasValues values) =>
-              Query style ignored -> values -> Consistency -> m (Result [ByteString])
+executeRaw :: (MonadCassandra m, CasValues i) =>
+              Query style any_i any_o -> i -> Consistency -> m (Result [ByteString])
 executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
 
 executeInternal :: CasValues values =>
-                   Query style ignored -> values -> Consistency -> StateT ActiveSession IO (Result [ByteString])
+                   Query style any_i any_o -> values -> Consistency -> StateT ActiveSession IO (Result [ByteString])
 executeInternal query i cons = do
     pq@(PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
@@ -960,10 +960,10 @@ executeInternal query i cons = do
         _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 -- | Execute a query that returns rows
-execute :: (MonadCassandra m, CasValues values) =>
-           Consistency -> Query Rows values -> m [values]
-execute cons q = do
-    res <- executeRaw q () cons
+execute :: (MonadCassandra m, CasValues i, CasValues o) =>
+           Consistency -> Query Rows i o -> i -> m [o]
+execute cons q i = do
+    res <- executeRaw q i cons
     case res of
         RowsResult meta rows -> decodeRows meta rows
         _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
@@ -979,8 +979,8 @@ decodeRows meta rows0 = do
     return $ rows2
 
 -- | Execute a write operation that returns void
-executeWrite :: (MonadCassandra m, CasValues values) =>
-                Consistency -> Query Write values -> values -> m ()
+executeWrite :: (MonadCassandra m, CasValues i) =>
+                Consistency -> Query Write i () -> i -> m ()
 executeWrite cons q i = do
     res <- executeRaw q i cons
     case res of
@@ -989,8 +989,8 @@ executeWrite cons q i = do
                               `T.append` " for query: " `T.append` T.pack (show q)
 
 -- | Execute a schema change, such as creating or dropping a table.
-executeSchema :: (MonadCassandra m, CasValues values) =>
-                 Consistency -> Query Schema values -> values -> m (Change, Keyspace, Table)
+executeSchema :: (MonadCassandra m, CasValues i) =>
+                 Consistency -> Query Schema i () -> i -> m (Change, Keyspace, Table)
 executeSchema cons q i = do
     res <- executeRaw q i cons
     case res of
