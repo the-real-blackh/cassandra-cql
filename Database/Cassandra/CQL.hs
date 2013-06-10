@@ -1,6 +1,52 @@
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving, ScopedTypeVariables,
         FlexibleInstances, DeriveDataTypeable, UndecidableInstances,
         BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures #-}
+-- | Haskell client for Cassandra's CQL protocol
+--
+-- This module isn't properly documented yet. For now, take a look at tests/example.hs.
+--
+-- Not all Cassandra data types supported yet: blanks below have not been implemented.
+--
+-- Correspondence between Haskell and CQL types:
+--
+-- * ascii - 'ByteString'
+--
+-- * bigint - 'Int64'
+--
+-- * blob - 'Blob' 'Bytestring'
+--
+-- * boolean - 'Bool'
+--
+-- * counter - 'Counter'
+--
+-- * decimal
+--
+-- * double
+--
+-- * float
+--
+-- * int - 'Int'
+--
+-- * text - 'Text'
+--
+-- * timestamp
+--
+-- * uuid - 'UUID'
+--
+-- * varchar
+--
+-- * varint
+--
+-- * timeuuid
+--
+-- * inet
+--
+-- * list<type>
+--
+-- * map<type, type>
+--
+-- * set<type>
+--
 module Database.Cassandra.CQL (
         -- * Initialization
         Server,
@@ -35,6 +81,7 @@ module Database.Cassandra.CQL (
         CasType(..),
         CasValues(..),
         Blob(..),
+        Counter(..),
         metadataTypes
     ) where
 
@@ -52,15 +99,13 @@ import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as L
 import Data.Either (lefts)
-import Data.Foldable (Foldable(..))
-import qualified Data.Foldable as Foldable
 import Data.Int
+import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
-import Data.Word
-import Data.Typeable
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
@@ -68,11 +113,14 @@ import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import Data.Typeable
+import Data.UUID (UUID)
+import qualified Data.UUID as UUID
+import Data.Word
 import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrInfo(..),
     connect, sClose)
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
-import Prelude hiding (foldr)
 
 type Server = (HostName, ServiceName)
 
@@ -256,7 +304,7 @@ sendFrame fr@(Frame flags stream opcode body) = do
             put opcode
             putWord32be $ fromIntegral $ B.length body
             putByteString body
-    -- putStrLn $ hexdump 0 (C.unpack bs)
+    --liftIO $ putStrLn $ hexdump 0 (C.unpack bs)
     s <- gets actSocket
     liftIO $ sendAll s bs
 
@@ -463,30 +511,30 @@ data Metadata = Metadata [ColumnSpec]
     deriving Show
 
 data CType = CCustom Text
-          | CAscii
-          | CBigint
-          | CBlob
-          | CBoolean
-          | CCounter
-          | CDecimal
-          | CDouble
-          | CFloat
-          | CInt
-          | CText
-          | CTimestamp
-          | CUuid
-          | CVarchar
-          | CVarint
-          | CTimeuuid
-          | CInet
-          | CList CType
-          | CMap CType CType
-          | CSet CType
+           | CAscii
+           | CBigint
+           | CBlob
+           | CBoolean
+           | CCounter
+           | CDecimal
+           | CDouble
+           | CFloat
+           | CInt
+           | CText
+           | CTimestamp
+           | CUuid
+           | CVarchar
+           | CVarint
+           | CTimeuuid
+           | CInet
+           | CList CType
+           | CMap CType CType
+           | CSet CType
     deriving (Eq, Ord, Show)
 
 instance CasType ByteString where
-    getCas = unLong <$> getElt
-    putCas = putElt . Long
+    getCas = getByteString =<< remaining
+    putCas = putByteString
     casType _ = CAscii
 
 instance CasType Int64 where
@@ -498,8 +546,8 @@ newtype Blob = Blob ByteString
     deriving (Eq, Ord, Show)
 
 instance CasType Blob where
-    getCas = Blob . unLong <$> getElt
-    putCas (Blob bs) = putElt $ Long bs
+    getCas = Blob <$> (getByteString =<< remaining)
+    putCas (Blob bs) = putByteString bs
     casType _ = CBlob
 
 instance CasType Bool where
@@ -508,10 +556,32 @@ instance CasType Bool where
     putCas False = putWord8 0
     casType _ = CBoolean
 
+newtype Counter = Counter Int64
+    deriving (Eq, Ord, Show, Read)
+
+instance CasType Counter where
+    getCas = Counter . fromIntegral <$> getWord64be
+    putCas (Counter c) = putWord64be (fromIntegral c)
+    casType _ = CCounter
+
+instance CasType Int where
+    getCas = fromIntegral <$> getWord32be
+    putCas = putWord32be . fromIntegral
+    casType _ = CInt
+
 instance CasType Text where
-    getCas = unLong <$> getElt
-    putCas = putElt . Long
+    getCas = T.decodeUtf8 <$> (getByteString =<< remaining)
+    putCas = putByteString . T.encodeUtf8
     casType _ = CText
+
+instance CasType UUID where
+    getCas = do
+        mUUID <- UUID.fromByteString . L.fromStrict <$> (getByteString =<< remaining)
+        case mUUID of
+            Just uuid -> return uuid
+            Nothing -> fail "malformed UUID"
+    putCas = putByteString . L.toStrict . UUID.toByteString
+    casType _ = CUuid
 
 instance ProtoElt CType where
     putElt _ = error "formatting CType is not implemented"
@@ -602,10 +672,6 @@ instance Functor Result where
     f `fmap` Prepared pqid meta = Prepared pqid meta
     f `fmap` SchemaChange ch ks t = SchemaChange ch ks t
 
-instance Foldable Result where
-    foldr f z (RowsResult _ rows) = foldr f z rows
-    foldr _ z _                   = z
-
 instance ProtoElt (Result [ByteString]) where
     putElt _ = error "formatting RESULT is not implemented"
     getElt = do
@@ -640,6 +706,7 @@ prepare (Query qid cql) = do
                             modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
                             return pq
                         _ -> throw $ LocalProtocolError $ "prepare: unexpected result " `T.append` T.pack (show res)
+                ERROR -> throwError (frBody fr)
                 _ -> throw $ LocalProtocolError $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 data CodingFailure = Mismatch Int CType CType
@@ -881,7 +948,10 @@ executeInternal query i cons = do
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
         putWord16be (fromIntegral $ length values)
-        mapM_ putCas values
+        forM_ values $ \value -> do
+            let enc = encodeCas value
+            putWord32be (fromIntegral $ B.length enc) 
+            putByteString enc
         putElt cons
     fr <- recvFrame
     case frOpcode fr of
