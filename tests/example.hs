@@ -16,13 +16,13 @@ dropSongs :: Query Schema () ()
 dropSongs = "drop table songs"
 
 createSongs :: Query Schema () ()
-createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist text, femaleSinger boolean, timesPlayed int)"
+createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist text, femaleSinger boolean, timesPlayed int, comment text)"
 
-insertSong :: Query Write (UUID, ByteString, Text, Bool, Int) ()
-insertSong = "insert into songs (id, title, artist, femaleSinger, timesPlayed) values (?, ?, ?, ?, ?)"
+insertSong :: Query Write (UUID, ByteString, Text, Bool, Int, Maybe Text) ()
+insertSong = "insert into songs (id, title, artist, femaleSinger, timesPlayed, comment) values (?, ?, ?, ?, ?, ?)"
 
-getSongs :: Query Rows () (UUID, ByteString, Text, Bool, Int)
-getSongs = "select id, title, artist, femaleSinger, timesPlayed from songs"
+getSongs :: Query Rows () (UUID, ByteString, Text, Bool, Int, Maybe Text)
+getSongs = "select id, title, artist, femaleSinger, timesPlayed, comment from songs"
 
 getOneSong :: Query Rows UUID (Text, Int)
 getOneSong = "select artist, timesPlayed from songs where id=?"
@@ -45,18 +45,19 @@ main = do
         u1 <- liftIO randomIO
         u2 <- liftIO randomIO
         u3 <- liftIO randomIO
-        executeWrite QUORUM insertSong (u1, "La Grange", "ZZ Top", False, 2)
-        executeWrite QUORUM insertSong (u2, "Your Star", "Evanescence", True, 799)
-        executeWrite QUORUM insertSong (u3, "Angel of Death", "Slayer", False, 50)
+        executeWrite QUORUM insertSong (u1, "La Grange", "ZZ Top", False, 2, Nothing)
+        executeWrite QUORUM insertSong (u2, "Your Star", "Evanescence", True, 799, Nothing)
+        executeWrite QUORUM insertSong (u3, "Angel of Death", "Slayer", False, 50, Just "Singer Tom Araya")
 
         songs <- executeRows QUORUM getSongs ()
-        liftIO $ forM_ songs $ \(uuid, title, artist, female, played) -> do
+        liftIO $ forM_ songs $ \(uuid, title, artist, female, played, mComment) -> do
             putStrLn ""
             putStrLn $ "id            : "++show uuid
             putStrLn $ "title         : "++C.unpack title
             putStrLn $ "artist        : "++T.unpack artist
             putStrLn $ "female singer : "++show female
             putStrLn $ "times played  : "++show played
+            putStrLn $ "comment       : "++show mComment
 
         liftIO $ putStrLn ""
-        liftIO . print =<< executeRow QUORUM getOneSong u2
+        --liftIO . print =<< executeRow QUORUM getOneSong u2

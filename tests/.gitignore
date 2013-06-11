@@ -1,2 +1,11 @@
 example
-test-*
+test-double
+test-float
+test-inet
+test-list
+test-set
+test-map
+test-timestamp
+test-timeuuid
+test-decimal
+test-varint

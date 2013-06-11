@@ -7,8 +7,7 @@
 --
 -- Credentials are not implemented yet.
 --
--- Here's the correspondence between Haskell and CQL types. Not all Cassandra data
--- types supported as yet: Haskell types listed below have been implemented.
+-- Here's the correspondence between Haskell and CQL types:
 --
 -- * ascii - 'ByteString'
 --
@@ -20,7 +19,7 @@
 --
 -- * counter - 'Counter'
 --
--- * decimal - 'Integer'
+-- * decimal - 'Rational'
 --
 -- * double - 'Double'
 --
@@ -36,7 +35,7 @@
 --
 -- * varchar
 --
--- * varint
+-- * varint - 'Integer'
 --
 -- * timeuuid - 'TimeUUID'
 --
@@ -130,8 +129,9 @@ import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrI
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
 import Unsafe.Coerce
---import qualified Data.ByteString.Char8 as C
---import Text.Hexdump
+import qualified Data.ByteString.Char8 as C
+import Text.Hexdump
+import Debug.Trace
 
 type Server = (HostName, ServiceName)
 
@@ -323,11 +323,6 @@ sendFrame fr@(Frame flags stream opcode body) = do
 class ProtoElt a where
     getElt :: Get a
     putElt :: a -> Put
-
-class CasType a where
-    getCas :: Get a
-    putCas :: a -> Put
-    casType :: a -> CType
 
 encodeElt :: ProtoElt a => a -> ByteString
 encodeElt = runPut . putElt
@@ -542,7 +537,56 @@ data CType = CCustom Text
            | CList CType
            | CMap CType CType
            | CSet CType
-    deriving (Eq, Ord, Show)
+           | CMaybe CType
+        deriving (Eq)
+
+instance Show CType where
+    show ct = case ct of
+        CCustom name -> T.unpack name
+        CAscii -> "ascii"
+        CBigint -> "bigint"
+        CBlob -> "blob"
+        CBoolean -> "boolean"
+        CCounter -> "counter"
+        CDecimal -> "decimal"
+        CDouble -> "double"
+        CFloat -> "float"
+        CInt -> "int"
+        CText -> "text"
+        CTimestamp -> "timestamp"
+        CUuid -> "uuid"
+        CVarchar -> "varchar"
+        CVarint -> "varint"
+        CTimeuuid -> "timeuuid"
+        CInet -> "inet"
+        CList t -> "list<"++show t++">"
+        CMap t1 t2 -> "map<"++show t1++","++show t2++">"
+        CSet t -> "set<"++show t++">"
+        CMaybe t -> "nullable "++show t
+
+equivalent :: CType -> CType -> Bool
+equivalent (CMaybe a) (CMaybe b) = a == b
+equivalent (CMaybe a) b = a == b
+equivalent a (CMaybe b) = a == b
+equivalent a b = a == b
+
+class CasType a where
+    getCas :: Get a
+    putCas :: a -> Put
+    casType :: a -> CType
+    casNothing :: a
+    casNothing = error "casNothing impossible"
+    casObliterate :: a -> ByteString -> Maybe ByteString
+    casObliterate _ bs = Just bs
+
+instance CasType a => CasType (Maybe a) where
+    getCas = Just <$> getCas
+    putCas Nothing = return ()
+    putCas (Just a) = putCas a
+    casType _ = CMaybe (casType (undefined :: a))
+    casNothing = Nothing
+    casObliterate (Just a) bs = Just bs
+    casObliterate Nothing  _  = Nothing
 
 instance CasType ByteString where
     getCas = getByteString =<< remaining
@@ -587,6 +631,7 @@ instance CasType Integer where
                     in  if head ws >= 0x80
                             then i - 1 `shiftL` (length ws * 8)
                             else i
+    putCas 0 = putWord8 0
     putCas i = putByteString . B.pack $
         if i < 0
             then encode 0x100 $ positivize 0x80 i
@@ -603,7 +648,7 @@ instance CasType Integer where
         positivize bits i = case bits + i of
                                 i' | i' >= 0 -> i' + bits
                                 _            -> positivize (bits `shiftL` 8) i
-    casType _ = CDecimal
+    casType _ = CVarint
 
 instance CasType Double where
     getCas = unsafeCoerce <$> getWord64be
@@ -814,7 +859,7 @@ instance Functor Result where
     f `fmap` Prepared pqid meta = Prepared pqid meta
     f `fmap` SchemaChange ch ks t = SchemaChange ch ks t
 
-instance ProtoElt (Result [ByteString]) where
+instance ProtoElt (Result [Maybe ByteString]) where
     putElt _ = error "formatting RESULT is not implemented"
     getElt = do
         kind <- getWord32be
@@ -824,7 +869,11 @@ instance ProtoElt (Result [ByteString]) where
                 meta@(Metadata colSpecs) <- getElt
                 let colCount = length colSpecs
                 rowCount <- fromIntegral <$> getWord32be
-                rows <- replicateM rowCount (replicateM colCount (unLong <$> getElt))
+                rows <- replicateM rowCount $ replicateM colCount $ do
+                    len <- getWord32be
+                    if len == 0xffffffff
+                        then return Nothing
+                        else Just <$> getByteString (fromIntegral len)
                 return $ RowsResult meta rows
             0x0003 -> SetKeyspace <$> getElt
             0x0004 -> Prepared <$> getElt <*> getElt
@@ -842,7 +891,7 @@ prepare (Query qid cql) = do
             case frOpcode fr of
                 RESULT -> do
                     res <- decodeEltM "RESULT" (frBody fr)
-                    case (res :: Result [ByteString]) of
+                    case (res :: Result [Maybe ByteString]) of
                         Prepared pqid meta -> do
                             let pq = PreparedQuery pqid meta
                             modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
@@ -854,15 +903,17 @@ prepare (Query qid cql) = do
 data CodingFailure = Mismatch Int CType CType
                    | WrongNumber Int Int
                    | DecodeFailure Int String
+                   | NullValue Int CType
 
 instance Show CodingFailure where
     show (Mismatch i t1 t2)    = "at value index "++show (i+1)++", Haskell type specifies "++show t1++", but database metadata says "++show t2
     show (WrongNumber i1 i2)   = "wrong number of values: Haskell type specifies "++show i1++" but database metadata says "++show i2
     show (DecodeFailure i why) = "failed to decode value index "++show (i+1)++": "++why
+    show (NullValue i t)       = "at value index "++show (i+1)++" received a null "++show t++" value but Haskell type is not a Maybe"
 
 class CasNested v where
-    encodeNested :: Int -> v -> [CType] -> Either CodingFailure [ByteString]
-    decodeNested :: Int -> [(CType, ByteString)] -> Either CodingFailure v
+    encodeNested :: Int -> v -> [CType] -> Either CodingFailure [Maybe ByteString]
+    decodeNested :: Int -> [(CType, Maybe ByteString)] -> Either CodingFailure v
     countNested  :: v -> Int
 
 instance CasNested () where
@@ -873,27 +924,29 @@ instance CasNested () where
     countNested _         = 0
 
 instance (CasType a, CasNested rem) => CasNested (a, rem) where
-    encodeNested !i (a, rem) (ta:trem) | ta == casType a =
+    encodeNested !i (a, rem) (ta:trem) | ta `equivalent` casType a =
         case encodeNested (i+1) rem trem of
             Left err -> Left err
-            Right brem -> Right $ encodeCas a : brem
+            Right brem -> Right $ ba : brem
+      where
+        ba = casObliterate a . encodeCas $ a
     encodeNested !i (a, _) (ta:_) = Left $ Mismatch i (casType a) ta
     encodeNested !i vs      []    = Left $ WrongNumber (i + countNested vs) i 
-    decodeNested !i ((ta, ba):rem) | ta == casType (undefined :: a) =
-        case decodeCas ba of
-            Left err -> Left $ DecodeFailure i err
-            Right a ->
-                case decodeNested (i+1) rem of
-                    Left err -> Left err
-                    Right arem -> Right (a, arem)
+    decodeNested !i ((ta, mba):rem) | ta `equivalent` casType (undefined :: a) =
+        case (decodeCas <$> mba, casType (undefined :: a), decodeNested (i+1) rem) of
+            (Nothing,         CMaybe _, Right arem) -> Right (casNothing, arem)
+            (Nothing,         _,        _)          -> Left $ NullValue i ta
+            (Just (Left err), _,        _)          -> Left $ DecodeFailure i err
+            (_,               _,        Left err)   -> Left err 
+            (Just (Right a),  _,        Right arem) -> Right (a, arem)
     decodeNested !i ((ta, _):rem) = Left $ Mismatch i (casType (undefined :: a)) ta
     decodeNested !i []            = Left $ WrongNumber (i + 1 + countNested (undefined :: rem)) i
     countNested _ = let n = 1 + countNested (undefined :: rem) 
                     in  seq n n
 
 class CasValues v where
-    encodeValues :: v -> [CType] -> Either CodingFailure [ByteString]
-    decodeValues :: [(CType, ByteString)] -> Either CodingFailure v
+    encodeValues :: v -> [CType] -> Either CodingFailure [Maybe ByteString]
+    decodeValues :: [(CType, Maybe ByteString)] -> Either CodingFailure v
 
 instance CasValues () where
     encodeValues () types = encodeNested 0 () types
@@ -1077,11 +1130,11 @@ instance ProtoElt Consistency where
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
 executeRaw :: (MonadCassandra m, CasValues i) =>
-              Query style any_i any_o -> i -> Consistency -> m (Result [ByteString])
+              Query style any_i any_o -> i -> Consistency -> m (Result [Maybe ByteString])
 executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
 
 executeInternal :: CasValues values =>
-                   Query style any_i any_o -> values -> Consistency -> StateT ActiveSession IO (Result [ByteString])
+                   Query style any_i any_o -> values -> Consistency -> StateT ActiveSession IO (Result [Maybe ByteString])
 executeInternal query i cons = do
     pq@(PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
@@ -1090,10 +1143,13 @@ executeInternal query i cons = do
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
         putWord16be (fromIntegral $ length values)
-        forM_ values $ \value -> do
-            let enc = encodeCas value
-            putWord32be (fromIntegral $ B.length enc) 
-            putByteString enc
+        forM_ values $ \mValue ->
+            case mValue of
+                Nothing -> putWord32be 0xffffffff
+                Just value -> do
+                    let enc = encodeCas value
+                    putWord32be (fromIntegral $ B.length enc) 
+                    putByteString enc
         putElt cons
     fr <- recvFrame
     case frOpcode fr of
@@ -1119,7 +1175,7 @@ executeRow cons q i = do
     rows <- executeRows cons q i
     return $ listToMaybe rows
 
-decodeRows :: (MonadCatchIO m, CasValues values) => Metadata -> [[ByteString]] -> m [values]
+decodeRows :: (MonadCatchIO m, CasValues values) => Metadata -> [[Maybe ByteString]] -> m [values]
 decodeRows meta rows0 = do
     let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
     case lefts rows1 of
