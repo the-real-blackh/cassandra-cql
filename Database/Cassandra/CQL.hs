@@ -22,15 +22,15 @@
 --
 -- * decimal
 --
--- * double
+-- * double - 'Double'
 --
--- * float
+-- * float - 'Float'
 --
 -- * int - 'Int'
 --
 -- * text - 'Text'
 --
--- * timestamp
+-- * timestamp - 'UTCTime'
 --
 -- * uuid - 'UUID'
 --
@@ -116,6 +116,8 @@ import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import Data.Time.Calendar
+import Data.Time.Clock
 import Data.Typeable
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
@@ -124,6 +126,9 @@ import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrI
     connect, sClose)
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
+import Unsafe.Coerce
+--import qualified Data.ByteString.Char8 as C
+--import Text.Hexdump
 
 type Server = (HostName, ServiceName)
 
@@ -567,6 +572,30 @@ instance CasType Counter where
     getCas = Counter . fromIntegral <$> getWord64be
     putCas (Counter c) = putWord64be (fromIntegral c)
     casType _ = CCounter
+
+instance CasType Double where
+    getCas = unsafeCoerce <$> getWord64be
+    putCas dbl = putWord64be (unsafeCoerce dbl)
+    casType _ = CDouble
+
+instance CasType Float where
+    getCas = unsafeCoerce <$> getWord32be
+    putCas dbl = putWord32be (unsafeCoerce dbl)
+    casType _ = CFloat
+
+epoch :: UTCTime
+epoch = UTCTime (fromGregorian 1970 1 1) 0
+
+instance CasType UTCTime where
+    getCas = do
+        ms <- getWord64be
+        let difft = realToFrac $ (fromIntegral ms :: Double) / 1000
+        return $ addUTCTime difft epoch
+    putCas utc = do
+        let seconds = realToFrac $ diffUTCTime utc epoch :: Double
+            ms = round (seconds * 1000) :: Word64
+        putWord64be ms
+    casType _ = CTimestamp
 
 instance CasType Int where
     getCas = fromIntegral <$> getWord32be

@@ -16,6 +16,9 @@ extra-source-files:  tests/example.hs
                      tests/test-map.hs
                      tests/test-set.hs
                      tests/test-list.hs
+                     tests/test-double.hs
+                     tests/test-float.hs
+                     tests/test-timestamp.hs
 
 source-repository head
   type:     git
@@ -33,7 +36,8 @@ library
                        bytestring       >= 0.10.0.0,
                        cryptohash       >= 0.9.0,
                        stm              >= 2.4.0,
-                       uuid             >= 1.2.0
+                       uuid             >= 1.2.0,
+                       time             >= 1.4.0.0
   ghc-options:         -Wall -fno-warn-name-shadowing -fno-warn-unused-matches
                        -fno-warn-missing-signatures -fno-warn-orphans
                        -fno-warn-unused-imports -fno-warn-unused-binds
