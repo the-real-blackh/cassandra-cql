@@ -27,6 +27,11 @@ getSongs = "select id, title, artist, femaleSinger, timesPlayed from songs"
 getOneSong :: Query Rows UUID (Text, Int)
 getOneSong = "select artist, timesPlayed from songs where id=?"
 
+ignoreDropFailure :: Cas () -> Cas ()
+ignoreDropFailure code = code `catch` \exc -> case exc of
+    ConfigError _ -> return ()  -- Ignore the error if the table doesn't exist
+    _             -> throw exc
+
 main = do
     {-
     Assuming a 'test' keyspace already exists. Here's some CQL to create it:
@@ -34,12 +39,7 @@ main = do
     -}
     pool <- createCassandraPool [("localhost", "9042")] "test" -- servers, keyspace
     runCas pool $ do
-        do
-            liftIO . print =<< executeSchema QUORUM dropSongs ()
-          `catch` \exc -> case exc of
-            ConfigError _ -> return ()  -- Ignore the error if the table doesn't exist
-            _             -> liftIO $ throw exc
-
+        ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropSongs ()
         liftIO . print =<< executeSchema QUORUM createSongs ()
 
         u1 <- liftIO randomIO
@@ -49,7 +49,7 @@ main = do
         executeWrite QUORUM insertSong (u2, "Your Star", "Evanescence", True, 799)
         executeWrite QUORUM insertSong (u3, "Angel of Death", "Slayer", False, 50)
 
-        songs <- execute QUORUM getSongs ()
+        songs <- executeRows QUORUM getSongs ()
         liftIO $ forM_ songs $ \(uuid, title, artist, female, played) -> do
             putStrLn ""
             putStrLn $ "id            : "++show uuid
@@ -59,4 +59,4 @@ main = do
             putStrLn $ "times played  : "++show played
 
         liftIO $ putStrLn ""
-        liftIO . print =<< execute QUORUM getOneSong u2
+        liftIO . print =<< executeRow QUORUM getOneSong u2

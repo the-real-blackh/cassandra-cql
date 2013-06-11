@@ -1,5 +1,5 @@
 name:                cassandra-cql
-version:             0.0.0.1
+version:             0.0.0.2
 synopsis:            Haskell client for Cassandra's CQL protocol
 description:         
   Haskell client for Cassandra's CQL protocol
@@ -13,6 +13,9 @@ build-type:          Simple
 stability:           alpha
 cabal-version:       >=1.8
 extra-source-files:  tests/example.hs
+                     tests/test-map.hs
+                     tests/test-set.hs
+                     tests/test-list.hs
 
 source-repository head
   type:     git

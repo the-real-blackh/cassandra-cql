@@ -42,11 +42,11 @@
 --
 -- * inet
 --
--- * list\<type\>
+-- * list\<a\> - [a]
 --
--- * map\<type, type\>
+-- * map\<a, b\> - 'Map' a b
 --
--- * set\<type\>
+-- * set\<a\> - 'Set' b
 --
 module Database.Cassandra.CQL (
         -- * Initialization
@@ -74,7 +74,8 @@ module Database.Cassandra.CQL (
         query,
         Style(..),
         -- * Operations
-        execute,
+        executeRows,
+        executeRow,
         executeWrite,
         executeSchema,
         executeRaw,
@@ -109,6 +110,8 @@ import Data.Maybe
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
+import Data.Set (Set)
+import qualified Data.Set as S
 import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -285,6 +288,7 @@ recvFrame = do
             body <- if length == 0
                 then pure B.empty
                 else liftIO $ recvAll s (fromIntegral length)
+            --liftIO $ putStrLn $ hexdump 0 (C.unpack $ hdrBs `B.append` body)
             return $ Frame flags stream opcode body
   where
     parseHeader = do
@@ -582,6 +586,56 @@ instance CasType UUID where
             Nothing -> fail "malformed UUID"
     putCas = putByteString . L.toStrict . UUID.toByteString
     casType _ = CUuid
+
+instance CasType a => CasType [a] where
+    getCas = do
+        n <- getWord16be
+        replicateM (fromIntegral n) $ do
+            len <- getWord16be
+            bs <- getByteString (fromIntegral len)
+            case decodeCas bs of
+                Left err -> fail err
+                Right x -> return x
+    putCas xs = do
+        putWord16be (fromIntegral $ length xs)
+        forM_ xs $ \x -> do
+            let bs = encodeCas x
+            putWord16be (fromIntegral $ B.length bs)
+            putByteString bs
+    casType _ = CList (casType (undefined :: a))
+
+instance (CasType a, Ord a) => CasType (Set a) where
+    getCas = S.fromList <$> getCas
+    putCas = putCas . S.toList
+    casType _ = CSet (casType (undefined :: a))
+
+instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
+    getCas = do
+        n <- getWord16be
+        items <- replicateM (fromIntegral n) $ do
+            len_a <- getWord16be
+            bs_a <- getByteString (fromIntegral len_a)
+            a <- case decodeCas bs_a of
+                Left err -> fail err
+                Right x -> return x
+            len_b <- getWord16be
+            bs_b <- getByteString (fromIntegral len_b)
+            b <- case decodeCas bs_b of
+                Left err -> fail err
+                Right x -> return x
+            return (a,b)
+        return $ M.fromList items
+    putCas m = do
+        let items = M.toList m
+        putWord16be (fromIntegral $ length items)
+        forM_ items $ \(a,b) -> do
+            let bs_a = encodeCas a
+            putWord16be (fromIntegral $ B.length bs_a)
+            putByteString bs_a
+            let bs_b = encodeCas b
+            putWord16be (fromIntegral $ B.length bs_b)
+            putByteString bs_b
+    casType _ = CMap (casType (undefined :: a)) (casType (undefined :: b))
 
 instance ProtoElt CType where
     putElt _ = error "formatting CType is not implemented"
@@ -960,14 +1014,22 @@ executeInternal query i cons = do
         _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
 -- | Execute a query that returns rows
-execute :: (MonadCassandra m, CasValues i, CasValues o) =>
-           Consistency -> Query Rows i o -> i -> m [o]
-execute cons q i = do
+executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
+               Consistency -> Query Rows i o -> i -> m [o]
+executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
         RowsResult meta rows -> decodeRows meta rows
         _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
                               `T.append` " for query: " `T.append` T.pack (show q)
+
+-- | Helper for 'executeRows' useful in situations where you are only expecting one row
+-- to be returned.
+executeRow :: (MonadCassandra m, CasValues i, CasValues o) =>
+              Consistency -> Query Rows i o -> i -> m (Maybe o)
+executeRow cons q i = do
+    rows <- executeRows cons q i
+    return $ listToMaybe rows
 
 decodeRows :: (MonadCatchIO m, CasValues values) => Metadata -> [[ByteString]] -> m [values]
 decodeRows meta rows0 = do
