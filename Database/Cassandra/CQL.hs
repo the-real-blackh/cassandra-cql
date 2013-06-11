@@ -443,7 +443,7 @@ instance ProtoElt (Long ByteString) where
         Long <$> getByteString (fromIntegral len)
 
 data TransportDirection = TransportSending | TransportReceiving
-    deriving Show
+    deriving (Eq, Show)
 
 -- | An exception that indicates an error originating in the Cassandra server.
 data CassandraException = AuthenticationException Text
