@@ -19,7 +19,7 @@
 --
 -- * counter - 'Counter'
 --
--- * decimal - 'Rational'
+-- * decimal - 'Decimal'
 --
 -- * double - 'Double'
 --
@@ -27,13 +27,11 @@
 --
 -- * int - 'Int'
 --
--- * text - 'Text'
+-- * text / varchar - 'Text'
 --
 -- * timestamp - 'UTCTime'
 --
 -- * uuid - 'UUID'
---
--- * varchar
 --
 -- * varint - 'Integer'
 --
@@ -46,7 +44,6 @@
 -- * map\<a, b\> - 'Map' a b
 --
 -- * set\<a\> - 'Set' b
---
 module Database.Cassandra.CQL (
         -- * Initialization
         Server,
@@ -102,6 +99,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import Data.Data
+import Data.Decimal
 import Data.Either (lefts)
 import Data.Int
 import Data.List
@@ -129,9 +127,8 @@ import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrI
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
 import Unsafe.Coerce
-import qualified Data.ByteString.Char8 as C
-import Text.Hexdump
-import Debug.Trace
+--import qualified Data.ByteString.Char8 as C
+--import Text.Hexdump
 
 type Server = (HostName, ServiceName)
 
@@ -530,7 +527,6 @@ data CType = CCustom Text
            | CText
            | CTimestamp
            | CUuid
-           | CVarchar
            | CVarint
            | CTimeuuid
            | CInet
@@ -555,7 +551,6 @@ instance Show CType where
         CText -> "text"
         CTimestamp -> "timestamp"
         CUuid -> "uuid"
-        CVarchar -> "varchar"
         CVarint -> "varint"
         CTimeuuid -> "timeuuid"
         CInet -> "inet"
@@ -631,24 +626,35 @@ instance CasType Integer where
                     in  if head ws >= 0x80
                             then i - 1 `shiftL` (length ws * 8)
                             else i
-    putCas 0 = putWord8 0
     putCas i = putByteString . B.pack $
         if i < 0
-            then encode 0x100 $ positivize 0x80 i
-            else encode 0x80  i
+            then encodeNeg $ positivize 0x80 i
+            else encodePos i
       where
-        encode :: Word8 -> Integer -> [Word8]
-        encode limit i = reverse $ enc i
+        encodePos :: Integer -> [Word8]
+        encodePos i = reverse $ enc i
           where
-            limit' = fromIntegral limit
-            enc i | i == 0     = []
-            enc i | i < limit' = [fromIntegral i]
-            enc i              = fromIntegral i : enc (i `shiftR` 8)
+            enc i | i == 0   = [0]
+            enc i | i < 0x80 = [fromIntegral i]
+            enc i            = fromIntegral i : enc (i `shiftR` 8)
+        encodeNeg :: Integer -> [Word8]
+        encodeNeg i = reverse $ enc i
+          where
+            enc i | i == 0    = []
+            enc i | i < 0x100 = [fromIntegral i]
+            enc i             = fromIntegral i : enc (i `shiftR` 8)
         positivize :: Integer -> Integer -> Integer
         positivize bits i = case bits + i of
                                 i' | i' >= 0 -> i' + bits
                                 _            -> positivize (bits `shiftL` 8) i
     casType _ = CVarint
+
+instance CasType Decimal where
+    getCas = Decimal <$> (fromIntegral . min 0xff <$> getWord32be) <*> getCas
+    putCas (Decimal places mantissa) = do
+        putWord32be (fromIntegral places)
+        putCas mantissa
+    casType _ = CDecimal
 
 instance CasType Double where
     getCas = unsafeCoerce <$> getWord64be
@@ -785,7 +791,9 @@ instance ProtoElt CType where
             0x0007 -> pure CDouble
             0x0008 -> pure CFloat
             0x0009 -> pure CInt
-            0x000a -> pure CVarchar
+            --0x000a -> pure CVarchar  -- Server seems to use CText even when 'varchar' is specified
+                                       -- i.e. they're interchangeable in the CQL and always
+                                       -- 'text' in the protocol.
             0x000b -> pure CTimestamp
             0x000c -> pure CUuid
             0x000d -> pure CText

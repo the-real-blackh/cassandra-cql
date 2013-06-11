@@ -16,7 +16,7 @@ dropSongs :: Query Schema () ()
 dropSongs = "drop table songs"
 
 createSongs :: Query Schema () ()
-createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist text, femaleSinger boolean, timesPlayed int, comment text)"
+createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist varchar, femaleSinger boolean, timesPlayed int, comment text)"
 
 insertSong :: Query Write (UUID, ByteString, Text, Bool, Int, Maybe Text) ()
 insertSong = "insert into songs (id, title, artist, femaleSinger, timesPlayed, comment) values (?, ?, ?, ?, ?, ?)"
