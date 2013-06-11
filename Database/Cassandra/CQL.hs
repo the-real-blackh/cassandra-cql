@@ -40,7 +40,7 @@
 --
 -- * timeuuid - 'TimeUUID'
 --
--- * inet
+-- * inet - 'SockAddr'
 --
 -- * list\<a\> - [a]
 --
@@ -126,7 +126,7 @@ import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import Data.Word
 import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrInfo(..),
-    connect, sClose)
+    connect, sClose, SockAddr(..))
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
 import Unsafe.Coerce
@@ -654,6 +654,26 @@ instance CasType TimeUUID where
     getCas = TimeUUID <$> getCas
     putCas (TimeUUID uuid) = putCas uuid
     casType _ = CTimeuuid
+
+instance CasType SockAddr where
+    getCas = do
+        len <- remaining
+        case len of
+            4  -> SockAddrInet 0 <$> getWord32le
+            16 -> do
+                a <- getWord32be
+                b <- getWord32be
+                c <- getWord32be
+                d <- getWord32be
+                return $ SockAddrInet6 0 0 (a,b,c,d) 0
+            _  -> fail "malformed Inet"
+    putCas sa = do
+         case sa of
+             SockAddrInet _ w -> putWord32le w
+             SockAddrInet6 _ _ (a,b,c,d) _ -> putWord32be a >> putWord32be b
+                                           >> putWord32be c >> putWord32be d
+             _ -> fail $ "address type not supported in formatting Inet: " ++ show sa
+    casType _ = CInet
 
 instance CasType a => CasType [a] where
     getCas = do
