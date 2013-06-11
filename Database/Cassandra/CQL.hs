@@ -5,7 +5,7 @@
 --
 -- For examples, take a look at the /tests/ directory in the source archive. 
 --
--- Here's the correspondence between Haskell and CQL types:
+-- Here's the correspondence between CQL and Haskell types:
 --
 -- * ascii - 'ByteString'
 --
@@ -101,12 +101,12 @@ module Database.Cassandra.CQL (
         Cas,
         runCas,
         CassandraException(..),
-        TransportDirection(..),
         CassandraCommsError(..),
+        TransportDirection(..),
         -- * Queries
         Query,
-        query,
         Style(..),
+        query,
         -- * Executing queries
         Consistency(..),
         Change(..),
@@ -447,7 +447,6 @@ data TransportDirection = TransportSending | TransportReceiving
 
 -- | An exception that indicates an error originating in the Cassandra server.
 data CassandraException = AuthenticationException Text
-                        | ValueMarshallingException TransportDirection Text
                         | ServerError Text
                         | ProtocolError Text
                         | BadCredentials Text
@@ -476,6 +475,7 @@ instance Exception CassandraException where
 -- 'LocalProtocolError' probably indicates a corrupted database or driver
 -- bug.
 data CassandraCommsError = LocalProtocolError Text
+                         | ValueMarshallingException TransportDirection Text
                          | CassandraIOException IOException
                          | ShortRead
     deriving (Show, Typeable)
@@ -638,7 +638,7 @@ equivalent (CMaybe a) b = a == b
 equivalent a (CMaybe b) = a == b
 equivalent a b = a == b
 
--- | A type class for types that can be used as query arguments or column values in
+-- | A type class for types that can be used in query arguments or column values in
 -- returned results.
 class CasType a where
     getCas :: Get a
@@ -1266,7 +1266,7 @@ executeInternal query i cons = do
         ERROR -> throwError (frBody fr)
         _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
 
--- | Execute a query that returns rows
+-- | Execute a query that returns rows.
 executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
                Consistency
             -> Query Rows i o  -- ^ CQL query to execute
@@ -1299,7 +1299,7 @@ decodeRows meta rows0 = do
     let rows2 = flip map rows1 $ \(Right v) -> v
     return $ rows2
 
--- | Execute a write operation that returns void
+-- | Execute a write operation that returns void.
 executeWrite :: (MonadCassandra m, CasValues i) =>
                 Consistency
              -> Query Write i ()  -- ^ CQL query to execute
