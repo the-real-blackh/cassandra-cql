@@ -42,7 +42,7 @@ ignoreDropFailure code = code `catch` \exc -> case exc of
     _             -> throw exc
 
 main = do
-    pool <- createCassandraPool [("localhost", "9042")] "test" -- servers, keyspace
+    pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace
     runCas pool $ do
         do
             ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropListsI ()

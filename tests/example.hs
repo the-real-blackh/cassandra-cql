@@ -4,7 +4,6 @@ import Database.Cassandra.CQL
 import Control.Monad
 import Control.Monad.CatchIO
 import Control.Monad.Trans (liftIO)
-import Data.Int
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as C
 import Data.Text (Text)
@@ -37,7 +36,7 @@ main = do
     Assuming a 'test' keyspace already exists. Here's some CQL to create it:
     CREATE KEYSPACE test WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : '1' };
     -}
-    pool <- createCassandraPool [("localhost", "9042")] "test" -- servers, keyspace
+    pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace
     runCas pool $ do
         ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropSongs ()
         liftIO . print =<< executeSchema QUORUM createSongs ()
@@ -60,4 +59,4 @@ main = do
             putStrLn $ "comment       : "++show mComment
 
         liftIO $ putStrLn ""
-        --liftIO . print =<< executeRow QUORUM getOneSong u2
+        liftIO . print =<< executeRow QUORUM getOneSong u2

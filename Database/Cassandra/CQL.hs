@@ -3,9 +3,7 @@
         BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures #-}
 -- | Haskell client for Cassandra's CQL protocol
 --
--- This module isn't properly documented yet. For now, take a look at tests/example.hs.
---
--- Credentials are not implemented yet.
+-- For examples, take a look at the /tests/ directory in the source archive. 
 --
 -- Here's the correspondence between Haskell and CQL types:
 --
@@ -44,44 +42,93 @@
 -- * map\<a, b\> - 'Map' a b
 --
 -- * set\<a\> - 'Set' b
+--
+-- The recommended way to use it is to specify your queries as global constants
+-- in this way:
+--
+-- > createSongs :: Query Schema () ()
+-- > createSongs = "create table songs (id uuid PRIMARY KEY, title text, artist text, comment text)"
+-- >
+-- > insertSong :: Query Write (UUID, Text, Text, Maybe Text) ()
+-- > insertSong = "insert into songs (id, title, artist, comment) values (?, ?, ?)"
+-- >
+-- > getOneSong :: Query Rows UUID (Text, Text, Maybe Text)
+-- > getOneSong = "select title, artist, comment from songs where id=?"
+--
+-- The three type parameters are the query type ('Schema', 'Write' or 'Rows') followed by the
+-- input and output types, which are given as tuples whose constituent types must match
+-- the ones in the query CQL. If you do not match them correctly, you'll get a runtime
+-- error when you execute the query. If you do, then the query becomes completely type
+-- safe.
+--
+-- Types can be 'Maybe' types, in which case you can read and write a Cassandra \'null\'
+-- in the table. Cassandra allows any column to be null, but you can lock this out by
+-- specifying non-Maybe types.
+--
+-- The reason why it is desirable for 'Query' values to be global constants (i.e. defined
+-- at top-level of your Haskell source) is because it's the fastest at runtime:
+-- Queries contain a hash value that is calculated lazily from the query text, which is
+-- used to locally cache prepared queries. If the constant is global, then Haskell caches
+-- the hash value so it gets calculated once only per query per program execution.
+--
+-- The query types are:
+--
+-- * 'Schema' for modifications to the schema. The output tuple type must be ().
+--
+-- * 'Write' for row inserts and updates, and such. The output tuple type must be ().
+--
+-- * 'Rows' for selects that give a list of rows in response.
+--
+-- The functions to use for these query types are 'executeSchema', 'executeWrite' and
+-- 'executeRows' or 'executeRow' respectively.
+--
+-- /To do/
+--
+-- * Add credentials.
+--
+-- * Improve connection pooling.
+--
+-- * Add the ability to easily run queries in parallel.
+
 module Database.Cassandra.CQL (
         -- * Initialization
         Server,
-        createCassandraPool,
-        CPool,
-        -- * Monads
+        Keyspace(..),
+        Pool,
+        newPool,
+        -- * Cassandra monad
         MonadCassandra,
         Cas,
         runCas,
         CassandraException(..),
         TransportDirection(..),
-        -- * Type used in operations
-        Keyspace(..),
-        Result(..),
-        TableSpec(..),
-        ColumnSpec(..),
-        Metadata(..),
-        CType(..),
-        Change(..),
-        Table(..),
-        Consistency(..),
+        CassandraCommsError(..),
         -- * Queries
         Query,
         query,
         Style(..),
-        -- * Operations
+        -- * Executing queries
+        Consistency(..),
+        Change(..),
+        executeSchema,
+        executeWrite,
         executeRows,
         executeRow,
-        executeWrite,
-        executeSchema,
-        executeRaw,
         -- * Value types
         CasType(..),
         CasValues(..),
         Blob(..),
         Counter(..),
         TimeUUID(..),
-        metadataTypes
+        metadataTypes,
+        -- * Lower-level interfaces
+        executeRaw,
+        Result(..),
+        TableSpec(..),
+        ColumnSpec(..),
+        Metadata(..),
+        CType(..),
+        Table(..)
     ) where
 
 import Control.Applicative
@@ -142,24 +189,26 @@ data Session = Session {
         sesActive :: Maybe ActiveSession
     }
 
-data CPool = CPool {
+-- | A handle for the state of the connection pool.
+data Pool = Pool {
         piKeyspace :: Keyspace,
         piSessions :: TVar (Seq Session)
     }
 
 class MonadCatchIO m => MonadCassandra m where
-    getEltsandraPool :: m CPool
+    getEltsandraPool :: m Pool
 
-createCassandraPool :: [Server] -> Keyspace -> IO CPool
-createCassandraPool svrs ks = do
+-- | Construct a pool of Cassandra connections.
+newPool :: [Server] -> Keyspace -> IO Pool
+newPool svrs ks = do
     let sessions = map (\svr -> Session svr Nothing) svrs
     sess <- atomically $ newTVar (Seq.fromList sessions)
-    return $ CPool {
+    return $ Pool {
             piKeyspace = ks,
             piSessions = sess
         }
 
-takeSession :: CPool -> IO Session
+takeSession :: Pool -> IO Session
 takeSession pool = atomically $ do
     sess <- readTVar (piSessions pool)
     if Seq.null sess
@@ -169,10 +218,10 @@ takeSession pool = atomically $ do
             writeTVar (piSessions pool) (Seq.drop 1 sess)
             return ses
 
-putSession :: CPool -> Session -> IO ()
+putSession :: Pool -> Session -> IO ()
 putSession pool ses = atomically $ modifyTVar (piSessions pool) (|> ses)
 
-connectIfNeeded :: CPool -> Session -> IO Session
+connectIfNeeded :: Pool -> Session -> IO Session
 connectIfNeeded pool session =
     if isJust (sesActive session)
         then return session
@@ -269,7 +318,7 @@ data Frame a = Frame {
 recvAll :: Socket -> Int -> IO ByteString
 recvAll s n = do
     bs <- recv s n
-    when (B.null bs) $ throw $ LocalProtocolError $ "short read"
+    when (B.null bs) $ throw ShortRead
     let left = n - B.length bs
     if left == 0
         then return bs
@@ -295,6 +344,7 @@ recvFrame = do
                 else liftIO $ recvAll s (fromIntegral length)
             --liftIO $ putStrLn $ hexdump 0 (C.unpack $ hdrBs `B.append` body)
             return $ Frame flags stream opcode body
+  `catch` \exc -> throw $ CassandraIOException exc
   where
     parseHeader = do
         ver <- getWord8
@@ -316,6 +366,7 @@ sendFrame fr@(Frame flags stream opcode body) = do
     --liftIO $ putStrLn $ hexdump 0 (C.unpack bs)
     s <- gets actSocket
     liftIO $ sendAll s bs
+  `catch` \exc -> throw $ CassandraIOException exc
 
 class ProtoElt a where
     getElt :: Get a
@@ -394,8 +445,8 @@ instance ProtoElt (Long ByteString) where
 data TransportDirection = TransportSending | TransportReceiving
     deriving Show
 
-data CassandraException = LocalProtocolError Text
-                        | AuthenticationException Text
+-- | An exception that indicates an error originating in the Cassandra server.
+data CassandraException = AuthenticationException Text
                         | ValueMarshallingException TransportDirection Text
                         | ServerError Text
                         | ProtocolError Text
@@ -415,6 +466,21 @@ data CassandraException = LocalProtocolError Text
     deriving (Show, Typeable)
 
 instance Exception CassandraException where
+
+-- | All errors at the communications level are reported with this exception
+-- ('IOException's from socket I/O are always wrapped), and this exception
+-- typically would mean that a retry is warranted.
+--
+-- Note that this exception isn't guaranteed to be a transient one, so a limit
+-- on the number of retries is likely to be a good idea.
+-- 'LocalProtocolError' probably indicates a corrupted database or driver
+-- bug.
+data CassandraCommsError = LocalProtocolError Text
+                         | CassandraIOException IOException
+                         | ShortRead
+    deriving (Show, Typeable)
+
+instance Exception CassandraCommsError
 
 throwError :: MonadCatchIO m => ByteString -> m a
 throwError bs = do
@@ -451,7 +517,7 @@ throwError bs = do
             0x2500 -> Unprepared <$> getElt <*> getElt
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
-introduce :: CPool -> StateT ActiveSession IO ()
+introduce :: Pool -> StateT ActiveSession IO ()
 introduce pool = do
     sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
     fr <- recvFrame
@@ -468,7 +534,7 @@ introduce pool = do
         _ -> throw $ ProtocolError $ "expected SetKeyspace, but got " `T.append` T.pack (show res)
                               `T.append` " for query: " `T.append` T.pack (show q)
 
-withSession :: MonadCassandra m => (CPool -> StateT ActiveSession IO a) -> m a
+withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
     pool <- getEltsandraPool
     mA <- liftIO $ do
@@ -495,25 +561,32 @@ withSession code = do
         Just a -> return a
         Nothing -> withSession code  -- Try again until we succeed
 
+-- | The name of a Cassandra keyspace. See the Cassandra documentation for more
+-- information.
 newtype Keyspace = Keyspace Text
     deriving (Eq, Ord, Show, IsString, ProtoElt)
 
+-- | The name of a Cassandra table (a.k.a. column family).
 newtype Table = Table Text
     deriving (Eq, Ord, Show, IsString, ProtoElt)
 
+-- | A fully qualified identification of a table that includes the 'Keyspace'. 
 data TableSpec = TableSpec Keyspace Table
-    deriving Show
+    deriving (Eq, Ord, Show)
 
 instance ProtoElt TableSpec where
     putElt _ = error "formatting TableSpec is not implemented"
     getElt = TableSpec <$> getElt <*> getElt
 
+-- | Information about a table column.
 data ColumnSpec = ColumnSpec TableSpec Text CType
     deriving Show
 
+-- | The specification of a list of result set columns.
 data Metadata = Metadata [ColumnSpec]
     deriving Show
 
+-- | Cassandra data types as used in metadata.
 data CType = CCustom Text
            | CAscii
            | CBigint
@@ -565,6 +638,8 @@ equivalent (CMaybe a) b = a == b
 equivalent a (CMaybe b) = a == b
 equivalent a b = a == b
 
+-- | A type class for types that can be used as query arguments or column values in
+-- returned results.
 class CasType a where
     getCas :: Get a
     putCas :: a -> Put
@@ -593,6 +668,8 @@ instance CasType Int64 where
     putCas = putWord64be . fromIntegral
     casType _ = CBigint
 
+-- | If you wrap this round a 'ByteString', it will be treated as a /blob/ type
+-- instead of /ascii/ (if it was a plain 'ByteString' type).
 newtype Blob = Blob ByteString
     deriving (Eq, Ord, Show)
 
@@ -607,6 +684,7 @@ instance CasType Bool where
     putCas False = putWord8 0
     casType _ = CBoolean
 
+-- | A Cassandra distributed counter value.
 newtype Counter = Counter Int64
     deriving (Eq, Ord, Show, Read)
 
@@ -699,7 +777,9 @@ instance CasType UUID where
     putCas = putByteString . L.toStrict . UUID.toByteString
     casType _ = CUuid
 
-data TimeUUID = TimeUUID UUID deriving (Eq, Data, Ord, Read, Show, Typeable)
+-- | If you wrap this round a 'UUID' then it is treated as a /timeuuid/ type instead of
+-- /uuid/ (if it was a plain 'UUID' type).
+newtype TimeUUID = TimeUUID UUID deriving (Eq, Data, Ord, Read, Show, Typeable)
 
 instance CasType TimeUUID where
     getCas = TimeUUID <$> getCas
@@ -825,8 +905,16 @@ newtype PreparedQueryID = PreparedQueryID ByteString
 newtype QueryID = QueryID (Digest SHA1)
     deriving (Eq, Ord, Show)
 
-data Style = Rows | Write | Schema
+-- | The first type argument for Query. Tells us what kind of query it is. 
+data Style = Schema   -- ^ A query that modifies the schema, such as DROP TABLE or CREATE TABLE
+           | Write    -- ^ A query that writes data, such as an INSERT or UPDATE
+           | Rows     -- ^ A query that returns a list of rows, such as SELECT
 
+-- | The text of a CQL query, along with type parameters to make the query type safe.
+-- The type arguments are 'Style', followed by input and output column types for the
+-- query each represented as a tuple.
+--
+-- The /DataKinds/ language extension is required for 'Style'.
 data Query :: Style -> * -> * -> * where
     Query :: QueryID -> Text -> Query style i o
     deriving Show
@@ -834,6 +922,14 @@ data Query :: Style -> * -> * -> * where
 instance IsString (Query style i o) where
     fromString = query . T.pack
 
+-- | Construct a query. Another way to construct one is as an overloaded string through
+-- the 'IsString' instance if you turn on the /OverloadedStrings/ language extension, e.g.
+--
+-- > {-# LANGUAGE OverloadedStrings #-}
+-- > ...
+-- >
+-- > getOneSong :: Query Rows UUID (Text, Text, Maybe Text)
+-- > getOneSong = "select title, artist, comment from songs where id=?"
 query :: Text -> Query style i o
 query cql = Query (QueryID . hash . T.encodeUtf8 $ cql) cql
 
@@ -853,6 +949,7 @@ instance ProtoElt Change where
             "DROPPED" -> pure DROPPED
             _ -> fail $ "unexpected change string: "++show str
 
+-- | A low-level query result used with 'executeRaw'.
 data Result vs = Void
                | RowsResult Metadata [vs]
                | SetKeyspace Text
@@ -952,6 +1049,8 @@ instance (CasType a, CasNested rem) => CasNested (a, rem) where
     countNested _ = let n = 1 + countNested (undefined :: rem) 
                     in  seq n n
 
+-- | A type class for a tuple of 'CasType' instances, representing either a list of
+-- arguments for a query, or the values in a row of returned query results.
 class CasValues v where
     encodeValues :: v -> [CType] -> Either CodingFailure [Maybe ByteString]
     decodeValues :: [(CType, Maybe ByteString)] -> Either CodingFailure v
@@ -1111,6 +1210,7 @@ instance (CasType a, CasType b, CasType c, CasType d, CasType e,
     decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, ())))))))))))))))))))) ->
         (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)) <$> decodeNested 0 vs
 
+-- | Cassandra consistency level. See the Cassandra documentation for an explanation.
 data Consistency = ANY | ONE | TWO | THREE | QUORUM | ALL | LOCAL_QUORUM | EACH_QUORUM
     deriving (Eq, Ord, Show, Bounded, Enum)
 
@@ -1137,6 +1237,7 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
+-- | A low-level function in case you need some rarely-used capabilities. 
 executeRaw :: (MonadCassandra m, CasValues i) =>
               Query style any_i any_o -> i -> Consistency -> m (Result [Maybe ByteString])
 executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
@@ -1167,7 +1268,10 @@ executeInternal query i cons = do
 
 -- | Execute a query that returns rows
 executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
-               Consistency -> Query Rows i o -> i -> m [o]
+               Consistency
+            -> Query Rows i o  -- ^ CQL query to execute
+            -> i               -- ^ Input values substituted in the query
+            -> m [o]
 executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
@@ -1178,7 +1282,10 @@ executeRows cons q i = do
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row
 -- to be returned.
 executeRow :: (MonadCassandra m, CasValues i, CasValues o) =>
-              Consistency -> Query Rows i o -> i -> m (Maybe o)
+              Consistency
+           -> Query Rows i o  -- ^ CQL query to execute
+           -> i               -- ^ Input values substituted in the query
+           -> m (Maybe o)
 executeRow cons q i = do
     rows <- executeRows cons q i
     return $ listToMaybe rows
@@ -1194,7 +1301,10 @@ decodeRows meta rows0 = do
 
 -- | Execute a write operation that returns void
 executeWrite :: (MonadCassandra m, CasValues i) =>
-                Consistency -> Query Write i () -> i -> m ()
+                Consistency
+             -> Query Write i ()  -- ^ CQL query to execute
+             -> i                 -- ^ Input values substituted in the query
+             -> m ()
 executeWrite cons q i = do
     res <- executeRaw q i cons
     case res of
@@ -1204,7 +1314,10 @@ executeWrite cons q i = do
 
 -- | Execute a schema change, such as creating or dropping a table.
 executeSchema :: (MonadCassandra m, CasValues i) =>
-                 Consistency -> Query Schema i () -> i -> m (Change, Keyspace, Table)
+                 Consistency
+              -> Query Schema i ()  -- ^ CQL query to execute
+              -> i                  -- ^ Input values substituted in the query
+              -> m (Change, Keyspace, Table)
 executeSchema cons q i = do
     res <- executeRaw q i cons
     case res of
@@ -1212,15 +1325,18 @@ executeSchema cons q i = do
         _ -> throw $ ProtocolError $ "expected SchemaChange, but got " `T.append` T.pack (show res)
                               `T.append` " for query: " `T.append` T.pack (show q)
 
+-- | A helper for extracting the types from a metadata definition.
 metadataTypes :: Metadata -> [CType]
 metadataTypes (Metadata colspecs) = map (\(ColumnSpec _ _ typ) -> typ) colspecs
 
-newtype Cas a = Cas (ReaderT CPool IO a)
+-- | The monad used to run Cassandra queries in.
+newtype Cas a = Cas (ReaderT Pool IO a)
     deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
 
 instance MonadCassandra Cas where
     getEltsandraPool = Cas ask
 
-runCas :: CPool -> Cas a -> IO a
+-- | Execute Cassandra queries.
+runCas :: Pool -> Cas a -> IO a
 runCas pool (Cas code) = runReaderT code pool 
 
