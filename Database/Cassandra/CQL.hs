@@ -20,7 +20,7 @@
 --
 -- * counter - 'Counter'
 --
--- * decimal
+-- * decimal - 'Integer'
 --
 -- * double - 'Double'
 --
@@ -38,7 +38,7 @@
 --
 -- * varint
 --
--- * timeuuid
+-- * timeuuid - 'TimeUUID'
 --
 -- * inet
 --
@@ -84,6 +84,7 @@ module Database.Cassandra.CQL (
         CasValues(..),
         Blob(..),
         Counter(..),
+        TimeUUID(..),
         metadataTypes
     ) where
 
@@ -101,6 +102,7 @@ import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
+import Data.Data
 import Data.Either (lefts)
 import Data.Int
 import Data.List
@@ -112,6 +114,7 @@ import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
 import Data.Set (Set)
 import qualified Data.Set as S
+import Foreign.Storable
 import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -573,6 +576,35 @@ instance CasType Counter where
     putCas (Counter c) = putWord64be (fromIntegral c)
     casType _ = CCounter
 
+instance CasType Integer where
+    getCas = do
+        ws <- B.unpack <$> (getByteString =<< remaining)
+        return $
+            if null ws
+                then 0
+                else
+                    let i = foldl' (\i w -> i `shiftL` 8 + fromIntegral w) 0 ws
+                    in  if head ws >= 0x80
+                            then i - 1 `shiftL` (length ws * 8)
+                            else i
+    putCas i = putByteString . B.pack $
+        if i < 0
+            then encode 0x100 $ positivize 0x80 i
+            else encode 0x80  i
+      where
+        encode :: Word8 -> Integer -> [Word8]
+        encode limit i = reverse $ enc i
+          where
+            limit' = fromIntegral limit
+            enc i | i == 0     = []
+            enc i | i < limit' = [fromIntegral i]
+            enc i              = fromIntegral i : enc (i `shiftR` 8)
+        positivize :: Integer -> Integer -> Integer
+        positivize bits i = case bits + i of
+                                i' | i' >= 0 -> i' + bits
+                                _            -> positivize (bits `shiftL` 8) i
+    casType _ = CDecimal
+
 instance CasType Double where
     getCas = unsafeCoerce <$> getWord64be
     putCas dbl = putWord64be (unsafeCoerce dbl)
@@ -615,6 +647,13 @@ instance CasType UUID where
             Nothing -> fail "malformed UUID"
     putCas = putByteString . L.toStrict . UUID.toByteString
     casType _ = CUuid
+
+data TimeUUID = TimeUUID UUID deriving (Eq, Data, Ord, Read, Show, Typeable)
+
+instance CasType TimeUUID where
+    getCas = TimeUUID <$> getCas
+    putCas (TimeUUID uuid) = putCas uuid
+    casType _ = CTimeuuid
 
 instance CasType a => CasType [a] where
     getCas = do

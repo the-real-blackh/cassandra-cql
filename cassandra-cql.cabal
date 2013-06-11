@@ -19,6 +19,8 @@ extra-source-files:  tests/example.hs
                      tests/test-double.hs
                      tests/test-float.hs
                      tests/test-timestamp.hs
+                     tests/test-decimal.hs
+                     tests/test-timeuuid.hs
 
 source-repository head
   type:     git
