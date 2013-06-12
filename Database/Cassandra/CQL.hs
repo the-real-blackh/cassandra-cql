@@ -43,8 +43,10 @@
 --
 -- * set\<a\> - 'Set' b
 --
--- The recommended way to use it is to specify your queries as global constants
--- in this way:
+-- ...and you can define your own 'CasType' instances to extend these types, which is
+-- a very powerful way to write your code.
+--
+-- One way to do things is to specify your queries with a type signature, like this:
 --
 -- > createSongs :: Query Schema () ()
 -- > createSongs = "create table songs (id uuid PRIMARY KEY, title text, artist text, comment text)"
@@ -65,12 +67,6 @@
 -- in the table. Cassandra allows any column to be null, but you can lock this out by
 -- specifying non-Maybe types.
 --
--- The reason why it is desirable for 'Query' values to be global constants (i.e. defined
--- at top-level of your Haskell source) is because it's the fastest at runtime:
--- Queries contain a hash value that is calculated lazily from the query text, which is
--- used to locally cache prepared queries. If the constant is global, then Haskell caches
--- the hash value so it gets calculated once only per query per program execution.
---
 -- The query types are:
 --
 -- * 'Schema' for modifications to the schema. The output tuple type must be ().
@@ -81,6 +77,13 @@
 --
 -- The functions to use for these query types are 'executeSchema', 'executeWrite' and
 -- 'executeRows' or 'executeRow' respectively.
+--
+-- This pattern seems to work very well, especially along with your own 'CasType'
+-- instances, because it neatly hides the mechanics from the body of your code:
+--
+-- > insertSong :: UUID -> Text -> Text -> Maybe Text -> Cas ()
+-- > insertSong id title artist comment = executeWrite QUORUM q (id, title, artist, comment)
+-- >      where q = "insert into songs (id, title, artist, comment) values (?, ?, ?, ?)"
 --
 -- /To do/
 --
@@ -115,12 +118,12 @@ module Database.Cassandra.CQL (
         executeRows,
         executeRow,
         -- * Value types
-        CasType(..),
-        CasValues(..),
         Blob(..),
         Counter(..),
         TimeUUID(..),
         metadataTypes,
+        CasType(..),
+        CasValues(..),
         -- * Lower-level interfaces
         executeRaw,
         Result(..),
@@ -640,9 +643,29 @@ equivalent a b = a == b
 
 -- | A type class for types that can be used in query arguments or column values in
 -- returned results.
+--
+-- To define your own newtypes for Cassandra data, you only need to define 'getCas',
+-- 'putCas' and 'casType', like this:
+--
+-- > instance CasType UserId where
+-- >     getCas = UserId <$> getCas
+-- >     putCas (UserId i) = putCas i
+-- >     casType (UserId i) = casType i
+--
+-- If you have a more complex type you want to store as a Cassandra blob, you could
+-- write an instance like this (assuming we're it's an instance of the /cereal/ package's
+-- 'Serialize' class):
+--
+-- > instance CasType User where
+-- >     getCas = decode . unBlob <$> getCas
+-- >     putCas = putCas . Blob . encode
+-- >     casType _ = CBlob
+
 class CasType a where
     getCas :: Get a
     putCas :: a -> Put
+    -- | For a given Haskell type given as ('undefined' :: a), tell the caller how Cassandra
+    -- represents it.
     casType :: a -> CType
     casNothing :: a
     casNothing = error "casNothing impossible"
@@ -670,7 +693,7 @@ instance CasType Int64 where
 
 -- | If you wrap this round a 'ByteString', it will be treated as a /blob/ type
 -- instead of /ascii/ (if it was a plain 'ByteString' type).
-newtype Blob = Blob ByteString
+newtype Blob = Blob { unBlob :: ByteString }
     deriving (Eq, Ord, Show)
 
 instance CasType Blob where
@@ -685,7 +708,7 @@ instance CasType Bool where
     casType _ = CBoolean
 
 -- | A Cassandra distributed counter value.
-newtype Counter = Counter Int64
+newtype Counter = Counter { unCounter :: Int64 }
     deriving (Eq, Ord, Show, Read)
 
 instance CasType Counter where
@@ -779,7 +802,7 @@ instance CasType UUID where
 
 -- | If you wrap this round a 'UUID' then it is treated as a /timeuuid/ type instead of
 -- /uuid/ (if it was a plain 'UUID' type).
-newtype TimeUUID = TimeUUID UUID deriving (Eq, Data, Ord, Read, Show, Typeable)
+newtype TimeUUID = TimeUUID { unTimeUUID :: UUID } deriving (Eq, Data, Ord, Read, Show, Typeable)
 
 instance CasType TimeUUID where
     getCas = TimeUUID <$> getCas
