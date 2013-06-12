@@ -78,7 +78,7 @@
 -- The functions to use for these query types are 'executeSchema', 'executeWrite' and
 -- 'executeRows' or 'executeRow' respectively.
 --
--- This pattern seems to work very well, especially along with your own 'CasType'
+-- The following pattern seems to work very well, especially along with your own 'CasType'
 -- instances, because it neatly hides the mechanics from the body of your code:
 --
 -- > insertSong :: UUID -> Text -> Text -> Maybe Text -> Cas ()
