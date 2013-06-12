@@ -97,7 +97,7 @@ module Database.Cassandra.CQL (
         Pool,
         newPool,
         -- * Cassandra monad
-        MonadCassandra,
+        MonadCassandra(..),
         Cas,
         runCas,
         CassandraException(..),
@@ -196,7 +196,7 @@ data Pool = Pool {
     }
 
 class MonadCatchIO m => MonadCassandra m where
-    getEltsandraPool :: m Pool
+    getCassandraPool :: m Pool
 
 -- | Construct a pool of Cassandra connections.
 newPool :: [Server] -> Keyspace -> IO Pool
@@ -536,7 +536,7 @@ introduce pool = do
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
-    pool <- getEltsandraPool
+    pool <- getCassandraPool
     mA <- liftIO $ do
         session <- connectIfNeeded pool =<< takeSession pool
         case sesActive session of
@@ -1334,7 +1334,7 @@ newtype Cas a = Cas (ReaderT Pool IO a)
     deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
 
 instance MonadCassandra Cas where
-    getEltsandraPool = Cas ask
+    getCassandraPool = Cas ask
 
 -- | Execute Cassandra queries.
 runCas :: Pool -> Cas a -> IO a
