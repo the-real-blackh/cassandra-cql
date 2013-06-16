@@ -38,8 +38,8 @@ selectT = "select items from listst"
 
 ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
-    ConfigError _ -> return ()  -- Ignore the error if the table doesn't exist
-    _             -> throw exc
+    ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
+    _               -> throw exc
 
 main = do
     pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace

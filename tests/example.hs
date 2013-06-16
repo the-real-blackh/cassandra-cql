@@ -28,8 +28,8 @@ getOneSong = "select artist, timesPlayed from songs where id=?"
 
 ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
-    ConfigError _ -> return ()  -- Ignore the error if the table doesn't exist
-    _             -> throw exc
+    ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
+    _               -> throw exc
 
 main = do
     {-
