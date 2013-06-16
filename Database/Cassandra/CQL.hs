@@ -79,11 +79,20 @@
 -- 'executeRows' or 'executeRow' respectively.
 --
 -- The following pattern seems to work very well, especially along with your own 'CasType'
--- instances, because it neatly hides the mechanics from the body of your code:
+-- instances, because it gives you a place to neatly add marshalling details that keeps
+-- away from the body of your code.
 --
 -- > insertSong :: UUID -> Text -> Text -> Maybe Text -> Cas ()
 -- > insertSong id title artist comment = executeWrite QUORUM q (id, title, artist, comment)
 -- >      where q = "insert into songs (id, title, artist, comment) values (?, ?, ?, ?)"
+--
+-- Incidentally, here's Haskell's little-known multi-line string syntax.
+-- You escape it using \\ and then another \\ where the string starts again.
+--
+-- > str = "multi\
+-- >        \line"
+--
+-- (gives \"multiline\")
 --
 -- /To do/
 --
@@ -332,16 +341,16 @@ recvAll s n = do
 protocolVersion :: Word8
 protocolVersion = 1
 
-recvFrame :: StateT ActiveSession IO (Frame ByteString)
-recvFrame = do
+recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
+recvFrame qt = do
     s <- gets actSocket
     hdrBs <- liftIO $ recvAll s 8
     case runGet parseHeader hdrBs of
-        Left err -> throw $ LocalProtocolError $ "recvFrame: " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
         Right (ver0, flags, stream, opcode, length) -> do
             let ver = ver0 .&. 0x7f
             when (ver /= protocolVersion) $
-                throw $ LocalProtocolError $ "unexpected version " `T.append` T.pack (show ver)
+                throw $ LocalProtocolError ("unexpected version " `T.append` T.pack (show ver)) qt
             body <- if length == 0
                 then pure B.empty
                 else liftIO $ recvAll s (fromIntegral length)
@@ -387,11 +396,11 @@ decodeElt bs = runGet getElt bs
 decodeCas :: CasType a => ByteString -> Either String a
 decodeCas bs = runGet getCas bs
 
-decodeEltM :: (ProtoElt a, MonadIO m) => Text -> ByteString -> m a
-decodeEltM what bs =
+decodeEltM :: (ProtoElt a, MonadIO m) => Text -> ByteString -> Text -> m a
+decodeEltM what bs qt =
     case decodeElt bs of
-        Left err -> throw $ LocalProtocolError $
-            "can't parse" `T.append` what `T.append` ": " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolError
+            ("can't parse" `T.append` what `T.append` ": " `T.append` T.pack err) qt
         Right res -> return res
 
 newtype Long a = Long { unLong :: a } deriving (Eq, Ord, Show, Read)
@@ -449,22 +458,21 @@ data TransportDirection = TransportSending | TransportReceiving
     deriving (Eq, Show)
 
 -- | An exception that indicates an error originating in the Cassandra server.
-data CassandraException = AuthenticationException Text
-                        | ServerError Text
-                        | ProtocolError Text
-                        | BadCredentials Text
-                        | UnavailableException Text Consistency Int Int
-                        | Overloaded Text
-                        | IsBootstrapping Text
-                        | TruncateError Text
-                        | WriteTimeout Text Consistency Int Int Text
-                        | ReadTimeout Text Consistency Int Int Bool
-                        | SyntaxError Text
-                        | Unauthorized Text
-                        | Invalid Text
-                        | ConfigError Text
-                        | AlreadyExists Text Keyspace Table
-                        | Unprepared Text PreparedQueryID
+data CassandraException = ServerError Text Text
+                        | ProtocolError Text Text
+                        | BadCredentials Text Text
+                        | UnavailableException Text Consistency Int Int Text
+                        | Overloaded Text Text
+                        | IsBootstrapping Text Text
+                        | TruncateError Text Text
+                        | WriteTimeout Text Consistency Int Int Text Text
+                        | ReadTimeout Text Consistency Int Int Bool Text
+                        | SyntaxError Text Text
+                        | Unauthorized Text Text
+                        | Invalid Text Text
+                        | ConfigError Text Text
+                        | AlreadyExists Text Keyspace Table Text
+                        | Unprepared Text PreparedQueryID Text
     deriving (Show, Typeable)
 
 instance Exception CassandraException where
@@ -477,65 +485,66 @@ instance Exception CassandraException where
 -- on the number of retries is likely to be a good idea.
 -- 'LocalProtocolError' probably indicates a corrupted database or driver
 -- bug.
-data CassandraCommsError = LocalProtocolError Text
-                         | ValueMarshallingException TransportDirection Text
+data CassandraCommsError = AuthenticationException Text
+                         | LocalProtocolError Text Text
+                         | ValueMarshallingException TransportDirection Text Text
                          | CassandraIOException IOException
                          | ShortRead
     deriving (Show, Typeable)
 
 instance Exception CassandraCommsError
 
-throwError :: MonadCatchIO m => ByteString -> m a
-throwError bs = do
+throwError :: MonadCatchIO m => Text -> ByteString -> m a
+throwError qt bs = do
     case runGet parseError bs of
-        Left err -> throw $ LocalProtocolError $ "failed to parse error: " `T.append` T.pack err
+        Left err -> throw $ LocalProtocolError ("failed to parse error: " `T.append` T.pack err) qt
         Right exc -> throw exc
   where
     parseError :: Get CassandraException
     parseError = do
        code <- getWord32be
        case code of
-            0x0000 -> ServerError <$> getElt 
-            0x000A -> ProtocolError <$> getElt
-            0x0100 -> BadCredentials <$> getElt
+            0x0000 -> ServerError <$> getElt <*> pure qt 
+            0x000A -> ProtocolError <$> getElt <*> pure qt
+            0x0100 -> BadCredentials <$> getElt <*> pure qt
             0x1000 -> UnavailableException <$> getElt <*> getElt
                                            <*> (fromIntegral <$> getWord32be)
-                                           <*> (fromIntegral <$> getWord32be)
-            0x1001 -> Overloaded <$> getElt
-            0x1002 -> IsBootstrapping <$> getElt
-            0x1003 -> TruncateError <$> getElt
+                                           <*> (fromIntegral <$> getWord32be) <*> pure qt
+            0x1001 -> Overloaded <$> getElt <*> pure qt
+            0x1002 -> IsBootstrapping <$> getElt <*> pure qt
+            0x1003 -> TruncateError <$> getElt <*> pure qt
             0x1100 -> WriteTimeout <$> getElt <*> getElt
                                    <*> (fromIntegral <$> getWord32be)
                                    <*> (fromIntegral <$> getWord32be)
-                                   <*> getElt
+                                   <*> getElt <*> pure qt
             0x1200 -> ReadTimeout <$> getElt <*> getElt
                                   <*> (fromIntegral <$> getWord32be)
                                   <*> (fromIntegral <$> getWord32be)
-                                  <*> ((/=0) <$> getWord8)
-            0x2000 -> SyntaxError <$> getElt
-            0x2100 -> Unauthorized <$> getElt
-            0x2200 -> Invalid <$> getElt
-            0x2300 -> ConfigError <$> getElt
-            0x2400 -> AlreadyExists <$> getElt <*> getElt <*> getElt
-            0x2500 -> Unprepared <$> getElt <*> getElt
+                                  <*> ((/=0) <$> getWord8) <*> pure qt
+            0x2000 -> SyntaxError <$> getElt <*> pure qt
+            0x2100 -> Unauthorized <$> getElt <*> pure qt
+            0x2200 -> Invalid <$> getElt <*> pure qt
+            0x2300 -> ConfigError <$> getElt <*> pure qt
+            0x2400 -> AlreadyExists <$> getElt <*> getElt <*> getElt <*> pure qt
+            0x2500 -> Unprepared <$> getElt <*> getElt <*> pure qt
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
 introduce :: Pool -> StateT ActiveSession IO ()
 introduce pool = do
+    let qt = "<startup>"
     sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
-    fr <- recvFrame
+    fr <- recvFrame qt
     case frOpcode fr of
         AUTHENTICATE -> throw $ AuthenticationException "authentication not implemented yet"
         READY -> return ()
-        ERROR -> throwError (frBody fr)
-        op -> throw $ LocalProtocolError $ "introduce: unexpected opcode " `T.append` T.pack (show op)
+        ERROR -> throwError qt (frBody fr)
+        op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
     let Keyspace ksName = piKeyspace pool
     let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
-        _ -> throw $ ProtocolError $ "expected SetKeyspace, but got " `T.append` T.pack (show res)
-                              `T.append` " for query: " `T.append` T.pack (show q)
+        _ -> throw $ LocalProtocolError ("expected SetKeyspace, but got " `T.append` T.pack (show res)) (queryText q)
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
@@ -647,13 +656,23 @@ equivalent a b = a == b
 -- To define your own newtypes for Cassandra data, you only need to define 'getCas',
 -- 'putCas' and 'casType', like this:
 --
+-- > newtype UserId = UserId UUID deriving (Eq, Show)
+-- >
 -- > instance CasType UserId where
 -- >     getCas = UserId <$> getCas
 -- >     putCas (UserId i) = putCas i
 -- >     casType (UserId i) = casType i
 --
+-- The same can be done more simply using the /GeneralizedNewtypeDeriving/ language
+-- extension, e.g.
+--
+-- > {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+-- >
+-- > ...
+-- > newtype UserId = UserId UUID deriving (Eq, Show, CasType)
+--
 -- If you have a more complex type you want to store as a Cassandra blob, you could
--- write an instance like this (assuming we're it's an instance of the /cereal/ package's
+-- write an instance like this (assuming it's an instance of the /cereal/ package's
 -- 'Serialize' class):
 --
 -- > instance CasType User where
@@ -942,6 +961,9 @@ data Query :: Style -> * -> * -> * where
     Query :: QueryID -> Text -> Query style i o
     deriving Show
 
+queryText :: Query s i o -> Text
+queryText (Query _ txt) = txt
+
 instance IsString (Query style i o) where
     fromString = query . T.pack
 
@@ -1015,18 +1037,18 @@ prepare (Query qid cql) = do
         Just pq -> return pq
         Nothing -> do
             sendFrame $ Frame [] 0 PREPARE $ encodeElt (Long cql)
-            fr <- recvFrame
+            fr <- recvFrame cql
             case frOpcode fr of
                 RESULT -> do
-                    res <- decodeEltM "RESULT" (frBody fr)
+                    res <- decodeEltM "RESULT" (frBody fr) cql
                     case (res :: Result [Maybe ByteString]) of
                         Prepared pqid meta -> do
                             let pq = PreparedQuery pqid meta
                             modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
                             return pq
-                        _ -> throw $ LocalProtocolError $ "prepare: unexpected result " `T.append` T.pack (show res)
-                ERROR -> throwError (frBody fr)
-                _ -> throw $ LocalProtocolError $ "prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+                        _ -> throw $ LocalProtocolError ("prepare: unexpected result " `T.append` T.pack (show res)) cql
+                ERROR -> throwError cql (frBody fr)
+                _ -> throw $ LocalProtocolError ("prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) cql
 
 data CodingFailure = Mismatch Int CType CType
                    | WrongNumber Int Int
@@ -1270,7 +1292,7 @@ executeInternal :: CasValues values =>
 executeInternal query i cons = do
     pq@(PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
-        Left err -> throw $ ValueMarshallingException TransportSending $ T.pack $ show err
+        Left err -> throw $ ValueMarshallingException TransportSending (T.pack $ show err) (queryText query)
         Right values -> return values
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
@@ -1283,11 +1305,11 @@ executeInternal query i cons = do
                     putWord32be (fromIntegral $ B.length enc) 
                     putByteString enc
         putElt cons
-    fr <- recvFrame
+    fr <- recvFrame (queryText query)
     case frOpcode fr of
-        RESULT -> decodeEltM "RESULT" (frBody fr)
-        ERROR -> throwError (frBody fr)
-        _ -> throw $ LocalProtocolError $ "execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))
+        RESULT -> decodeEltM "RESULT" (frBody fr) (queryText query)
+        ERROR -> throwError (queryText query) (frBody fr)
+        _ -> throw $ LocalProtocolError ("execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) (queryText query)
 
 -- | Execute a query that returns rows.
 executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
@@ -1298,9 +1320,8 @@ executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
 executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
-        RowsResult meta rows -> decodeRows meta rows
-        _ -> throw $ ProtocolError $ "expected Rows, but got " `T.append` T.pack (show res)
-                              `T.append` " for query: " `T.append` T.pack (show q)
+        RowsResult meta rows -> decodeRows q meta rows
+        _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row
 -- to be returned.
@@ -1313,11 +1334,11 @@ executeRow cons q i = do
     rows <- executeRows cons q i
     return $ listToMaybe rows
 
-decodeRows :: (MonadCatchIO m, CasValues values) => Metadata -> [[Maybe ByteString]] -> m [values]
-decodeRows meta rows0 = do
+decodeRows :: (MonadCatchIO m, CasValues values) => Query Rows any_i values -> Metadata -> [[Maybe ByteString]] -> m [values]
+decodeRows query meta rows0 = do
     let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
     case lefts rows1 of
-        (err:_) -> throw $ ValueMarshallingException TransportReceiving $ T.pack $ show err
+        (err:_) -> throw $ ValueMarshallingException TransportReceiving (T.pack $ show err) (queryText query)
         [] -> return ()
     let rows2 = flip map rows1 $ \(Right v) -> v
     return $ rows2
@@ -1332,8 +1353,7 @@ executeWrite cons q i = do
     res <- executeRaw q i cons
     case res of
         Void -> return ()
-        _ -> throw $ ProtocolError $ "expected Void, but got " `T.append` T.pack (show res)
-                              `T.append` " for query: " `T.append` T.pack (show q)
+        _ -> throw $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Execute a schema change, such as creating or dropping a table.
 executeSchema :: (MonadCassandra m, CasValues i) =>
@@ -1345,8 +1365,7 @@ executeSchema cons q i = do
     res <- executeRaw q i cons
     case res of
         SchemaChange ch ks ta -> return (ch, ks, ta)
-        _ -> throw $ ProtocolError $ "expected SchemaChange, but got " `T.append` T.pack (show res)
-                              `T.append` " for query: " `T.append` T.pack (show q)
+        _ -> throw $ LocalProtocolError ("expected SchemaChange, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | A helper for extracting the types from a metadata definition.
 metadataTypes :: Metadata -> [CType]
