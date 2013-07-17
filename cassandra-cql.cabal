@@ -1,7 +1,7 @@
 name:                cassandra-cql
-version:             0.2.0.2
+version:             0.3.0.0
 synopsis:            Haskell client for Cassandra's CQL protocol
-description:         
+description:
   Haskell client for Cassandra's CQL protocol
 license:             BSD3
 license-file:        LICENSE
@@ -33,7 +33,7 @@ library
   build-depends:       base             >= 4.5.0.0 && < 4.7.0.0,
                        containers       >= 0.4.0.0,
                        mtl              >= 2.1.0,
-                       MonadCatchIO-mtl >= 0.3.0.0,
+                       MonadCatchIO-transformers >= 0.3.0.0,
                        network          >= 2.4.0.0,
                        text             >= 0.11.0.0,
                        cereal           >= 0.3.0.0,

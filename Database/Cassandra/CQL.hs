@@ -140,7 +140,8 @@ module Database.Cassandra.CQL (
         ColumnSpec(..),
         Metadata(..),
         CType(..),
-        Table(..)
+        Table(..),
+        PreparedQueryID(..)
     ) where
 
 import Control.Applicative
@@ -151,6 +152,12 @@ import Control.Monad.CatchIO
 import Control.Monad.Reader
 import Control.Monad.State hiding (get, put)
 import qualified Control.Monad.State as State
+import qualified Control.Monad.Reader
+import qualified Control.Monad.RWS
+import qualified Control.Monad.State
+import qualified Control.Monad.State.Strict
+import qualified Control.Monad.Error
+import qualified Control.Monad.Writer
 import Control.Monad.Trans
 import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
@@ -165,6 +172,7 @@ import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
+import Data.Monoid (Monoid)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
@@ -209,6 +217,21 @@ data Pool = Pool {
 
 class MonadCatchIO m => MonadCassandra m where
     getCassandraPool :: m Pool
+
+instance MonadCassandra m => MonadCassandra (Control.Monad.Reader.ReaderT a m) where
+    getCassandraPool = lift getCassandraPool
+
+instance MonadCassandra m => MonadCassandra (Control.Monad.State.StateT a m) where
+    getCassandraPool = lift getCassandraPool
+
+instance (MonadCassandra m, Control.Monad.Error.Error e) => MonadCassandra (Control.Monad.Error.ErrorT e m) where
+    getCassandraPool = lift getCassandraPool
+
+instance (MonadCassandra m, Monoid a) => MonadCassandra (Control.Monad.Writer.WriterT a m) where
+    getCassandraPool = lift getCassandraPool
+
+instance (MonadCassandra m, Monoid w) => MonadCassandra (Control.Monad.RWS.RWST r w s m) where
+    getCassandraPool = lift getCassandraPool
 
 -- | Construct a pool of Cassandra connections.
 newPool :: [Server] -> Keyspace -> IO Pool
