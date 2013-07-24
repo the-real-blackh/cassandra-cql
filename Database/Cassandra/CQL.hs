@@ -190,7 +190,7 @@ import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import Data.Word
 import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrInfo(..),
-    connect, sClose, SockAddr(..))
+    connect, sClose, SockAddr(..), SocketType(..), defaultHints)
 import Network.Socket.ByteString (send, sendAll, recv)
 import Numeric
 import Unsafe.Coerce
@@ -261,8 +261,9 @@ connectIfNeeded pool session =
     if isJust (sesActive session)
         then return session
         else do
+            let hints = defaultHints { addrSocketType = Stream }
             let (host, service) = sesServer session
-            ais <- getAddrInfo Nothing (Just  host) (Just service)
+            ais <- getAddrInfo (Just hints) (Just host) (Just service)
             mSocket <- foldM (\mSocket ai -> do
                     case mSocket of
                         Nothing -> do
