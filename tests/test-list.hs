@@ -39,10 +39,13 @@ selectT = "select items from listst"
 ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
     ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
+    Invalid _ _ -> return ()
     _               -> throw exc
 
 main = do
-    pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace
+    --let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
+    let auth = Nothing
+    pool <- newPool [("localhost", "9042")] "test" auth -- servers, keyspace, auth
     runCas pool $ do
         do
             ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropListsI ()
@@ -54,19 +57,18 @@ main = do
             executeWrite QUORUM insertI (u1, [10,11,12])
             executeWrite QUORUM insertI (u2, [2,4,6,8])
             executeWrite QUORUM insertI (u3, [900,1000,1100])
-    
+
             liftIO . print =<< executeRows QUORUM selectI ()
 
         do
             ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropListsT ()
             liftIO . print =<< executeSchema QUORUM createListsT ()
-    
+
             u1 <- liftIO randomIO
             u2 <- liftIO randomIO
             u3 <- liftIO randomIO
             executeWrite QUORUM insertT (u1, ["dog","cat","rabbit"])
             executeWrite QUORUM insertT (u2, ["carrot","tomato"])
             executeWrite QUORUM insertT (u3, ["a","b","c"])
-    
-            liftIO . print =<< executeRows QUORUM selectT ()
 
+            liftIO . print =<< executeRows QUORUM selectT ()

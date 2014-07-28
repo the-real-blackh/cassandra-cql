@@ -26,10 +26,13 @@ select = "select item from decimals where id=?"
 ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
     ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
+    Invalid _ _ -> return ()
     _               -> throw exc
 
 main = do
-    pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace
+    --let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
+    let auth = Nothing
+    pool <- newPool [("localhost", "9042")] "test" auth -- servers, keyspace, auth
     runCas pool $ do
         ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropLists ()
         liftIO . print =<< executeSchema QUORUM createLists ()
@@ -50,8 +53,7 @@ main = do
         executeWrite QUORUM insert (u6, read "-3.141592654")
         executeWrite QUORUM insert (u7, read "-0.000000001")
         executeWrite QUORUM insert (u8, read "118000")
- 
+
         let us = [u1,u2,u3,u4,u5,u6,u7, u8]
         forM_ us $ \u ->
             liftIO . print =<< executeRow QUORUM select u
-
