@@ -29,14 +29,17 @@ getOneSong = "select artist, timesPlayed from songs where id=?"
 ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
     ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
+    Invalid _ _ -> return ()
     _               -> throw exc
 
 main = do
+    --let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
+    let auth = Nothing
     {-
     Assuming a 'test' keyspace already exists. Here's some CQL to create it:
     CREATE KEYSPACE test WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : '1' };
     -}
-    pool <- newPool [("localhost", "9042")] "test" -- servers, keyspace
+    pool <- newPool [("localhost", "9042")] "test" auth -- servers, keyspace, maybe auth
     runCas pool $ do
         ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropSongs ()
         liftIO . print =<< executeSchema QUORUM createSongs ()

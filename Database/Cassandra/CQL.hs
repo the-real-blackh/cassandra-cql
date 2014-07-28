@@ -3,7 +3,7 @@
         BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures #-}
 -- | Haskell client for Cassandra's CQL protocol
 --
--- For examples, take a look at the /tests/ directory in the source archive. 
+-- For examples, take a look at the /tests/ directory in the source archive.
 --
 -- Here's the correspondence between CQL and Haskell types:
 --
@@ -115,6 +115,8 @@ module Database.Cassandra.CQL (
         CassandraException(..),
         CassandraCommsError(..),
         TransportDirection(..),
+        -- * Auth
+        Authentication (..),
         -- * Queries
         Query,
         Style(..),
@@ -212,7 +214,8 @@ data Session = Session {
 -- | A handle for the state of the connection pool.
 data Pool = Pool {
         piKeyspace :: Keyspace,
-        piSessions :: TVar (Seq Session)
+        piSessions :: TVar (Seq Session),
+        piAuth :: Maybe Authentication
     }
 
 class MonadCatchIO m => MonadCassandra m where
@@ -234,13 +237,14 @@ instance (MonadCassandra m, Monoid w) => MonadCassandra (Control.Monad.RWS.RWST 
     getCassandraPool = lift getCassandraPool
 
 -- | Construct a pool of Cassandra connections.
-newPool :: [Server] -> Keyspace -> IO Pool
-newPool svrs ks = do
+newPool :: [Server] -> Keyspace -> Maybe Authentication -> IO Pool
+newPool svrs ks auth = do
     let sessions = map (\svr -> Session svr Nothing) svrs
     sess <- atomically $ newTVar (Seq.fromList sessions)
     return $ Pool {
             piKeyspace = ks,
-            piSessions = sess
+            piSessions = sess,
+            piAuth = auth
         }
 
 takeSession :: Pool -> IO Session
@@ -256,8 +260,8 @@ takeSession pool = atomically $ do
 putSession :: Pool -> Session -> IO ()
 putSession pool ses = atomically $ modifyTVar (piSessions pool) (|> ses)
 
-connectIfNeeded :: Pool -> Session -> IO Session
-connectIfNeeded pool session =
+connectIfNeeded :: Pool -> Maybe Authentication -> Session -> IO Session
+connectIfNeeded pool auth session =
     if isJust (sesActive session)
         then return session
         else do
@@ -282,7 +286,7 @@ connectIfNeeded pool session =
                                 actSocket = socket,
                                 actQueryCache = M.empty
                             }
-                    active' <- execStateT (introduce pool) active
+                    active' <- execStateT (introduce pool auth) active
                     return $ session { sesActive = Just active' }
                 Nothing ->
                     return session
@@ -328,18 +332,18 @@ instance Serialize Opcode where
     get = do
         w <- getWord8
         case w of
-            0x00 -> return $ ERROR        
-            0x01 -> return $ STARTUP      
-            0x02 -> return $ READY        
-            0x03 -> return $ AUTHENTICATE 
-            0x04 -> return $ CREDENTIALS  
-            0x05 -> return $ OPTIONS      
-            0x06 -> return $ SUPPORTED    
-            0x07 -> return $ QUERY        
-            0x08 -> return $ RESULT                            
-            0x09 -> return $ PREPARE      
-            0x0a -> return $ EXECUTE      
-            0x0b -> return $ REGISTER     
+            0x00 -> return $ ERROR
+            0x01 -> return $ STARTUP
+            0x02 -> return $ READY
+            0x03 -> return $ AUTHENTICATE
+            0x04 -> return $ CREDENTIALS
+            0x05 -> return $ OPTIONS
+            0x06 -> return $ SUPPORTED
+            0x07 -> return $ QUERY
+            0x08 -> return $ RESULT
+            0x09 -> return $ PREPARE
+            0x0a -> return $ EXECUTE
+            0x0b -> return $ REGISTER
             0x0c -> return $ EVENT
             _    -> fail $ "unknown opcode 0x"++showHex w ""
 
@@ -511,6 +515,7 @@ instance Exception CassandraException where
 -- bug.
 data CassandraCommsError = AuthenticationException Text
                          | LocalProtocolError Text Text
+                         | MissingAuthenticationError Text Text
                          | ValueMarshallingException TransportDirection Text Text
                          | CassandraIOException IOException
                          | ShortRead
@@ -528,7 +533,7 @@ throwError qt bs = do
     parseError = do
        code <- getWord32be
        case code of
-            0x0000 -> ServerError <$> getElt <*> pure qt 
+            0x0000 -> ServerError <$> getElt <*> pure qt
             0x000A -> ProtocolError <$> getElt <*> pure qt
             0x0100 -> BadCredentials <$> getElt <*> pure qt
             0x1000 -> UnavailableException <$> getElt <*> getElt
@@ -553,16 +558,38 @@ throwError qt bs = do
             0x2500 -> Unprepared <$> getElt <*> getElt <*> pure qt
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
-introduce :: Pool -> StateT ActiveSession IO ()
-introduce pool = do
+
+type User = T.Text
+type Password = T.Text
+data Authentication = PasswordAuthenticator User Password
+type Credentials = [(Text, Text)]
+
+authCredentials :: Authentication -> Credentials
+authCredentials (PasswordAuthenticator user password) = [("username", user), ("password", password)]
+
+authenticate :: Authentication -> StateT ActiveSession IO ()
+authenticate auth = do
+  let qt = "<credentials>"
+  sendFrame $ Frame [] 0 CREDENTIALS $ encodeElt $ authCredentials auth
+  fr2 <- recvFrame qt
+  case frOpcode fr2 of
+    READY -> return ()
+    ERROR -> throwError qt (frBody fr2)
+    op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
+
+introduce :: Pool -> Maybe Authentication -> StateT ActiveSession IO ()
+introduce pool auth = do
     let qt = "<startup>"
     sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
     fr <- recvFrame qt
     case frOpcode fr of
-        AUTHENTICATE -> throw $ AuthenticationException "authentication not implemented yet"
-        READY -> return ()
-        ERROR -> throwError qt (frBody fr)
-        op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
+      AUTHENTICATE -> maybe
+        (throw $ MissingAuthenticationError "introduce: server expects auth but none provided" "<credentials>")
+        authenticate auth
+      READY -> return ()
+      ERROR -> throwError qt (frBody fr)
+      op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
+
     let Keyspace ksName = piKeyspace pool
     let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
@@ -573,8 +600,9 @@ introduce pool = do
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
     pool <- getCassandraPool
+    let auth = piAuth pool
     mA <- liftIO $ do
-        session <- connectIfNeeded pool =<< takeSession pool
+        session <- connectIfNeeded pool auth =<< takeSession pool
         case sesActive session of
             Just active -> do
                 (a, active') <- runStateT (code pool) active
@@ -595,7 +623,7 @@ withSession code = do
                 return Nothing
     case mA of
         Just a -> return a
-        Nothing -> withSession code  -- Try again until we succeed
+        Nothing -> withSession code -- Try again until we succeed
 
 -- | The name of a Cassandra keyspace. See the Cassandra documentation for more
 -- information.
@@ -606,7 +634,7 @@ newtype Keyspace = Keyspace Text
 newtype Table = Table Text
     deriving (Eq, Ord, Show, IsString, ProtoElt)
 
--- | A fully qualified identification of a table that includes the 'Keyspace'. 
+-- | A fully qualified identification of a table that includes the 'Keyspace'.
 data TableSpec = TableSpec Keyspace Table
     deriving (Eq, Ord, Show)
 
@@ -971,7 +999,7 @@ newtype PreparedQueryID = PreparedQueryID ByteString
 newtype QueryID = QueryID (Digest SHA1)
     deriving (Eq, Ord, Show)
 
--- | The first type argument for Query. Tells us what kind of query it is. 
+-- | The first type argument for Query. Tells us what kind of query it is.
 data Style = Schema   -- ^ A query that modifies the schema, such as DROP TABLE or CREATE TABLE
            | Write    -- ^ A query that writes data, such as an INSERT or UPDATE
            | Rows     -- ^ A query that returns a list of rows, such as SELECT
@@ -1105,17 +1133,17 @@ instance (CasType a, CasNested rem) => CasNested (a, rem) where
       where
         ba = casObliterate a . encodeCas $ a
     encodeNested !i (a, _) (ta:_) = Left $ Mismatch i (casType a) ta
-    encodeNested !i vs      []    = Left $ WrongNumber (i + countNested vs) i 
+    encodeNested !i vs      []    = Left $ WrongNumber (i + countNested vs) i
     decodeNested !i ((ta, mba):rem) | ta `equivalent` casType (undefined :: a) =
         case (decodeCas <$> mba, casType (undefined :: a), decodeNested (i+1) rem) of
             (Nothing,         CMaybe _, Right arem) -> Right (casNothing, arem)
             (Nothing,         _,        _)          -> Left $ NullValue i ta
             (Just (Left err), _,        _)          -> Left $ DecodeFailure i err
-            (_,               _,        Left err)   -> Left err 
+            (_,               _,        Left err)   -> Left err
             (Just (Right a),  _,        Right arem) -> Right (a, arem)
     decodeNested !i ((ta, _):rem) = Left $ Mismatch i (casType (undefined :: a)) ta
     decodeNested !i []            = Left $ WrongNumber (i + 1 + countNested (undefined :: rem)) i
-    countNested _ = let n = 1 + countNested (undefined :: rem) 
+    countNested _ = let n = 1 + countNested (undefined :: rem)
                     in  seq n n
 
 -- | A type class for a tuple of 'CasType' instances, representing either a list of
@@ -1306,10 +1334,10 @@ instance ProtoElt Consistency where
             0x0007 -> pure EACH_QUORUM
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
--- | A low-level function in case you need some rarely-used capabilities. 
+-- | A low-level function in case you need some rarely-used capabilities.
 executeRaw :: (MonadCassandra m, CasValues i) =>
               Query style any_i any_o -> i -> Consistency -> m (Result [Maybe ByteString])
-executeRaw query i cons = withSession $ \_ -> executeInternal query i cons
+executeRaw query i cons = withSession (\_ -> executeInternal query i cons)
 
 executeInternal :: CasValues values =>
                    Query style any_i any_o -> values -> Consistency -> StateT ActiveSession IO (Result [Maybe ByteString])
@@ -1326,7 +1354,7 @@ executeInternal query i cons = do
                 Nothing -> putWord32be 0xffffffff
                 Just value -> do
                     let enc = encodeCas value
-                    putWord32be (fromIntegral $ B.length enc) 
+                    putWord32be (fromIntegral $ B.length enc)
                     putByteString enc
         putElt cons
     fr <- recvFrame (queryText query)
@@ -1404,5 +1432,4 @@ instance MonadCassandra Cas where
 
 -- | Execute Cassandra queries.
 runCas :: Pool -> Cas a -> IO a
-runCas pool (Cas code) = runReaderT code pool 
-
+runCas pool (Cas code) = runReaderT code pool
