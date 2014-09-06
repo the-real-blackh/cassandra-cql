@@ -199,11 +199,14 @@ import Debug.Trace
 defaultConnectionTimeout :: NominalDiffTime
 defaultConnectionTimeout = 10
 
+defaultSessionCreateTimeout :: NominalDiffTime
+defaultSessionCreateTimeout = 20
+
 defaultBackoffOnError :: NominalDiffTime
 defaultBackoffOnError = 60
 
 defaultMaxSessionIdleTime :: NominalDiffTime
-defaultMaxSessionIdleTime = 300
+defaultMaxSessionIdleTime = 60
 
 defaultMaxSessions :: Int
 defaultMaxSessions = 20
@@ -219,8 +222,9 @@ data ActiveSession = ActiveSession {
 
 
 data Session = Session {
-        sessServer     :: Server,
-        sessSocket     :: Socket
+      sessServerIndex :: Int,
+      sessServer      :: Server,
+      sessSocket      :: Socket
     }
 
 
@@ -240,11 +244,12 @@ instance Ord ServerState where
 
 
 data PoolConfig = PoolConfig {
-      piKeyspace          :: Keyspace,
-      piAuth              :: Maybe Authentication,
-      piServers           :: TVar (Seq.Seq ServerState),
-      piConnectionTimeout :: NominalDiffTime,
-      piBackoffOnError    :: NominalDiffTime
+      piKeyspace             :: Keyspace,
+      piAuth                 :: Maybe Authentication,
+      piServers              :: TVar (Seq.Seq ServerState),
+      piSessionCreateTimeout :: NominalDiffTime,
+      piConnectionTimeout    :: NominalDiffTime,
+      piBackoffOnError       :: NominalDiffTime
     }
 
 newtype Pool = Pool (PoolConfig, P.Pool Session)
@@ -281,11 +286,12 @@ newPool svrs ks auth = do
           piKeyspace = ks,
           piAuth = auth,
           piServers = servers',
+          piSessionCreateTimeout = defaultSessionCreateTimeout,
           piConnectionTimeout = defaultConnectionTimeout,
           piBackoffOnError = defaultBackoffOnError
           }
 
-    sessions <- P.createPool (newSession poolConfig) destroySession 1 defaultMaxSessionIdleTime defaultMaxSessions
+    sessions <- P.createPool (newSession poolConfig) (destroySession poolConfig) 1 defaultMaxSessionIdleTime defaultMaxSessions
 
     let pool = Pool (poolConfig, sessions)
 
@@ -338,7 +344,7 @@ newSession poolConfig = do
 
   startTime <- getCurrentTime
 
-  let giveUpAt = piConnectionTimeout poolConfig `addUTCTime` startTime
+  let giveUpAt = piSessionCreateTimeout poolConfig `addUTCTime` startTime
 
       loop = do
         timeLeft <- (giveUpAt `diffUTCTime`) <$> getCurrentTime
@@ -364,6 +370,8 @@ newSession poolConfig = do
       chooseServer = atomically $ do
                              servers <- readTVar (piServers poolConfig)
 
+                             trace ("server state : " ++ show servers) (return ())
+
                              let available = filter (ssAvailable . snd) (zip [0..] $ F.toList servers)
 
                              if null available
@@ -381,29 +389,33 @@ newSession poolConfig = do
                           atomically $ modifyTVar' (piServers poolConfig) (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1, ssLastError = Just now, ssAvailable = False }) idx)
 
 
-      setup (ServerState { ssServer }, _) = setupConnection poolConfig ssServer giveUpAt
+      setup (ServerState { ssServer }, idx) = setupConnection poolConfig idx ssServer
 
   loop
 
 
 
-destroySession :: Session -> IO ()
-destroySession Session { sessSocket } = sClose sessSocket
+destroySession :: PoolConfig -> Session -> IO ()
+destroySession poolConfig Session { sessSocket, sessServerIndex } = mask $ \restore -> do
+                                                                      atomically $ modifyTVar' (piServers poolConfig) (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1 }) sessServerIndex)
+                                                                      restore (sClose sessSocket)
   
   
 
-setupConnection :: PoolConfig -> Server -> UTCTime -> IO Session
-setupConnection poolConfig server giveUpAt = do
+setupConnection :: PoolConfig -> Int -> Server -> IO Session
+setupConnection poolConfig serverIndex server = do
     let hints = defaultHints { addrSocketType = Stream }
         (host, service) = server
 
     traceIO $ "attempting to connect to " ++ host
 
+    startTime <- getCurrentTime
+
     ais <- getAddrInfo (Just hints) (Just host) (Just service)
 
-    bracketOnError (connectSocket ais) (maybe (return ()) sClose) buildSession
+    bracketOnError (connectSocket startTime ais) (maybe (return ()) sClose) buildSession
 
-    where connectSocket ais = 
+    where connectSocket startTime ais = 
               foldM (\mSocket ai -> do
                        case mSocket of
 
@@ -414,12 +426,14 @@ setupConnection poolConfig server giveUpAt = do
 
                                       -- No need to use 'bracketOnError' here because we are already masked.
                                       s <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
-                                      connect s (addrAddress ai) `onException` sClose s
-                                      return $ Just s
+                                      mConn <- timeout ((floor $ (piConnectionTimeout poolConfig) * 1000000) :: Int) (connect s (addrAddress ai)) `onException` sClose s
+                                      case mConn of
+                                        Nothing -> sClose s >> return Nothing
+                                        Just _ -> return $ Just s
 
                            now <- getCurrentTime
                             
-                           if now >= giveUpAt
+                           if now `diffUTCTime` startTime >= piConnectionTimeout poolConfig
                              then return Nothing
                              else tryConnect `catch` (\ (e :: SomeException) -> do
                                                         traceIO $ "failed to connect to address " ++ show ai ++ " : " ++ show e
@@ -434,6 +448,7 @@ setupConnection poolConfig server giveUpAt = do
             traceIO $ "made connection, now doing setup to " ++ show s
 
             let active = Session {
+                           sessServerIndex = serverIndex,
                            sessServer = server,
                            sessSocket = s
                          }
