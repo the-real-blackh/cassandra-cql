@@ -143,7 +143,9 @@ module Database.Cassandra.CQL (
         Metadata(..),
         CType(..),
         Table(..),
-        PreparedQueryID(..)
+        PreparedQueryID(..),
+        serverStats,
+        ServerStat(..)
     ) where
 
 import Control.Applicative
@@ -199,6 +201,9 @@ import Debug.Trace
 defaultConnectionTimeout :: NominalDiffTime
 defaultConnectionTimeout = 10
 
+defaultIoTimeout :: NominalDiffTime
+defaultIoTimeout = 300
+
 defaultSessionCreateTimeout :: NominalDiffTime
 defaultSessionCreateTimeout = 20
 
@@ -217,6 +222,7 @@ type Server = (HostName, ServiceName)
 data ActiveSession = ActiveSession {
         actServer     :: Server,
         actSocket     :: Socket,
+        actIoTimeout  :: NominalDiffTime,
         actQueryCache :: Map QueryID PreparedQuery
     }
 
@@ -249,8 +255,16 @@ data PoolConfig = PoolConfig {
       piServers              :: TVar (Seq.Seq ServerState),
       piSessionCreateTimeout :: NominalDiffTime,
       piConnectionTimeout    :: NominalDiffTime,
+      piIoTimeout            :: NominalDiffTime,
       piBackoffOnError       :: NominalDiffTime
     }
+
+-- | Exported stats for a server.
+data ServerStat = ServerStat {
+      statServer       :: Server,
+      statSessionCount :: Int,
+      statAvailable    :: Bool 
+} deriving (Show)
 
 newtype Pool = Pool (PoolConfig, P.Pool Session)
 
@@ -288,6 +302,7 @@ newPool svrs ks auth = do
           piServers = servers',
           piSessionCreateTimeout = defaultSessionCreateTimeout,
           piConnectionTimeout = defaultConnectionTimeout,
+          piIoTimeout = defaultIoTimeout,
           piBackoffOnError = defaultBackoffOnError
           }
 
@@ -331,6 +346,11 @@ poolWatch (Pool (config, _)) = do
 
   loop
 
+
+serverStats :: Pool -> IO [ServerStat]
+serverStats (Pool (config, _)) = atomically $ do
+                                   servers <- readTVar (piServers config)
+                                   return $ map (\ServerState { ssServer, ssSessionCount, ssAvailable } -> ServerStat { statServer = ssServer, statSessionCount = ssSessionCount, statAvailable = ssAvailable }) (F.toList servers)
 
                
 
@@ -453,7 +473,7 @@ setupConnection poolConfig serverIndex server = do
                            sessSocket = s
                          }
 
-            evalStateT (introduce poolConfig) (activeSession active)
+            evalStateT (introduce poolConfig) (activeSession poolConfig active)
 
             return active
 
@@ -524,15 +544,18 @@ data Frame a = Frame {
     }
     deriving Show
 
-recvAll :: Socket -> Int -> IO ByteString
-recvAll s n = do
+timeout' :: NominalDiffTime -> IO a -> IO a
+timeout' to = timeout (floor $ to * 1000000) >=> maybe (throwIO CoordinatorTimeout) return
+
+recvAll :: NominalDiffTime -> Socket -> Int -> IO ByteString
+recvAll ioTimeout s n = timeout' ioTimeout $ do
     bs <- recv s n
     when (B.null bs) $ throw ShortRead
     let left = n - B.length bs
     if left == 0
         then return bs
         else do
-            bs' <- recvAll s left
+            bs' <- recvAll ioTimeout s left
             return (bs `B.append` bs')
 
 protocolVersion :: Word8
@@ -541,7 +564,8 @@ protocolVersion = 1
 recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
 recvFrame qt = do
     s <- gets actSocket
-    hdrBs <- liftIO $ recvAll s 8
+    ioTimeout <- gets actIoTimeout
+    hdrBs <- liftIO $ recvAll ioTimeout s 8
     case runGet parseHeader hdrBs of
         Left err -> throw $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
         Right (ver0, flags, stream, opcode, length) -> do
@@ -550,7 +574,7 @@ recvFrame qt = do
                 throw $ LocalProtocolError ("unexpected version " `T.append` T.pack (show ver)) qt
             body <- if length == 0
                 then pure B.empty
-                else liftIO $ recvAll s (fromIntegral length)
+                else liftIO $ recvAll ioTimeout s (fromIntegral length)
             --liftIO $ putStrLn $ hexdump 0 (C.unpack $ hdrBs `B.append` body)
             return $ Frame flags stream opcode body
   `catch` \exc -> throw $ CassandraIOException exc
@@ -574,7 +598,8 @@ sendFrame (Frame flags stream opcode body) = do
             putByteString body
     --liftIO $ putStrLn $ hexdump 0 (C.unpack bs)
     s <- gets actSocket
-    liftIO $ sendAll s bs
+    ioTimeout <- gets actIoTimeout
+    liftIO $ timeout' ioTimeout $ sendAll s bs
   `catch` \exc -> throw $ CassandraIOException exc
 
 class ProtoElt a where
@@ -689,6 +714,7 @@ data CassandraCommsError = AuthenticationException Text
                          | CassandraIOException IOException
                          | ShortRead
                          | NoAvailableServers
+                         | CoordinatorTimeout
     deriving (Show, Typeable)
 
 instance Exception CassandraCommsError
@@ -769,28 +795,28 @@ introduce PoolConfig { piKeyspace, piAuth }  = do
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
-    pool@(Pool (poolState, sessions)) <- getCassandraPool
-    let auth = piAuth poolState
+    pool@(Pool (poolConfig, sessions)) <- getCassandraPool
 
     liftIO $ mask $ \restore -> do
-                     (session, local) <- P.takeResource sessions
+                     (session, local') <- P.takeResource sessions
 
-                     a <- restore (evalStateT (code pool) (activeSession session))
+                     a <- restore (evalStateT (code pool) (activeSession poolConfig session))
                           `catches`
-                                [ Handler $ \(exc :: CassandraException) -> P.putResource local session >> throwIO exc,
-                                  Handler $ \(exc :: SomeException) -> P.destroyResource sessions local session >> throwIO exc
+                                [ Handler $ \(exc :: CassandraException) -> P.putResource local' session >> throwIO exc,
+                                  Handler $ \(exc :: SomeException) -> P.destroyResource sessions local' session >> throwIO exc
                                 ]
 
-                     P.putResource local session
+                     P.putResource local' session
 
                      return a
 
-activeSession :: Session -> ActiveSession
-activeSession session = ActiveSession {
-                          actServer = sessServer session,
-                          actSocket = sessSocket session,
-                          actQueryCache = M.empty
-                        }
+activeSession :: PoolConfig -> Session -> ActiveSession
+activeSession poolConfig session = ActiveSession {
+                                     actServer = sessServer session,
+                                     actSocket = sessSocket session,
+                                     actIoTimeout = piIoTimeout poolConfig,
+                                     actQueryCache = M.empty
+                                   }
 
 -- | The name of a Cassandra keyspace. See the Cassandra documentation for more
 -- information.
