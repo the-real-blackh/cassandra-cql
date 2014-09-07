@@ -11,6 +11,7 @@ import Data.Text (Text, pack)
 import Data.UUID (UUID)
 import Data.UUID.V4 (nextRandom)
 import Database.Cassandra.CQL
+import System.Log.Logger
 
 createThings :: Query Schema () ()
 createThings = "create table if not exists things (id uuid PRIMARY KEY, val text)"
@@ -33,8 +34,15 @@ simpleRetry todo = do
            threadDelay 1000000
            simpleRetry todo
 
+-- Debug and higher goes to STDERR
+setupLogging :: IO ()
+setupLogging = updateGlobalLogger rootLoggerName (setLevel DEBUG)
+
+
 main :: IO ()
 main = do
+  setupLogging
+
   let auth = Nothing
   -- first server should be unresponsive
   pool <- newPool [("172.16.0.1", "9042"), ("localhost", "9042")] "test" auth

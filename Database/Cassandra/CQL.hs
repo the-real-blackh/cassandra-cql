@@ -196,7 +196,7 @@ import Unsafe.Coerce
 import Data.Function (on)
 import Data.Monoid ((<>))
 import System.Timeout (timeout)
-import Debug.Trace
+import System.Log.Logger (debugM, warningM)
 
 defaultConnectionTimeout :: NominalDiffTime
 defaultConnectionTimeout = 10
@@ -321,7 +321,7 @@ poolWatch (Pool (config, _)) = do
   let loop = do
         cutoff <- (piBackoffOnError config `addUTCTime`) <$> getCurrentTime
 
-        traceIO "starting pool watch"
+        debugM "Database.Cassandra.CQL.poolWatch" "starting"
         sleepTil <- atomically $ do
                           servers <- readTVar (piServers config)
 
@@ -339,7 +339,7 @@ poolWatch (Pool (config, _)) = do
         delay <- (sleepTil `diffUTCTime`) <$> getCurrentTime
 
         statusDump <- atomically $ readTVar (piServers config)
-        traceIO $ "completed pool watch, delaying for " ++ show delay ++ ", states : " ++ show statusDump
+        debugM "Database.Cassandra.CQL.poolWatch" $ "completed : delaying for " ++ show delay ++ ", server states : " ++ show statusDump
 
         threadDelay (floor $ delay * 1000000)
         loop
@@ -357,7 +357,7 @@ serverStats (Pool (config, _)) = atomically $ do
 
 newSession :: PoolConfig -> IO Session
 newSession poolConfig = do
-  traceIO "entering newSession"
+  debugM "Database.Cassandra.CQL.nextSession" "starting"
 
   maskingState <- getMaskingState
   when (maskingState == Unmasked) $ throwIO $ userError "caller MUST mask async exceptions before attempting to create a session"
@@ -371,13 +371,13 @@ newSession poolConfig = do
 
         when (timeLeft <= 0) $ throwIO NoAvailableServers
 
-        traceIO "attempting to make a new session"
+        debugM "Database.Cassandra.CQL.newSession" "starting attempt to create a new session"
         sessionZ <- timeout ((floor $ timeLeft * 1000000) :: Int) makeSession
                     `catches` [ Handler $ (\(e :: CassandraCommsError) -> do 
-                                             traceIO $ "failed to make a session due to temporary error, will retry : " ++ show e
+                                             warningM "Database.Cassandra.CQL.newSession" $ "failed to create a session due to temporary error (will retry) : " ++ show e
                                              return Nothing),
                                 Handler $ (\(e :: SomeException) -> do
-                                             traceIO $ "failed to make a session due to permanent error, will rethrow : " ++ show e
+                                             warningM "Database.Cassandra.CQL.newSession" $ "failed to create a session due to permanent error (will rethrow) : " ++ show e
                                              throwIO e)
                               ]
 
@@ -389,8 +389,6 @@ newSession poolConfig = do
 
       chooseServer = atomically $ do
                              servers <- readTVar (piServers poolConfig)
-
-                             trace ("server state : " ++ show servers) (return ())
 
                              let available = filter (ssAvailable . snd) (zip [0..] $ F.toList servers)
 
@@ -427,7 +425,7 @@ setupConnection poolConfig serverIndex server = do
     let hints = defaultHints { addrSocketType = Stream }
         (host, service) = server
 
-    traceIO $ "attempting to connect to " ++ host
+    debugM "Database.Cassandra.CQL.setupConnection" $ "attempting to connect to " ++ host
 
     startTime <- getCurrentTime
 
@@ -442,7 +440,7 @@ setupConnection poolConfig serverIndex server = do
                          Nothing -> do
 
                            let tryConnect = do
-                                      traceIO $ "trying address " ++ show ai
+                                      debugM "Database.Cassandra.CQL.setupConnection" $ "trying address " ++ show ai
 
                                       -- No need to use 'bracketOnError' here because we are already masked.
                                       s <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
@@ -456,7 +454,7 @@ setupConnection poolConfig serverIndex server = do
                            if now `diffUTCTime` startTime >= piConnectionTimeout poolConfig
                              then return Nothing
                              else tryConnect `catch` (\ (e :: SomeException) -> do
-                                                        traceIO $ "failed to connect to address " ++ show ai ++ " : " ++ show e
+                                                        debugM "Database.Cassandra.CQL.setupConnection" $ "failed to connect to address " ++ show ai ++ " : " ++ show e
                                                         return Nothing
                                                      )
 
@@ -465,7 +463,7 @@ setupConnection poolConfig serverIndex server = do
 
 
           buildSession (Just s) = do
-            traceIO $ "made connection, now doing setup to " ++ show s
+            debugM "Database.Cassandra.CQL.setupConnection" $ "made connection, now attempting setup for socket " ++ show s
 
             let active = Session {
                            sessServerIndex = serverIndex,
