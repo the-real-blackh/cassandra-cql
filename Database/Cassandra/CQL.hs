@@ -108,6 +108,8 @@ module Database.Cassandra.CQL (
         Keyspace(..),
         Pool,
         newPool,
+        newPool',
+        defaultConfig,
         -- * Cassandra monad
         MonadCassandra(..),
         Cas,
@@ -145,7 +147,8 @@ module Database.Cassandra.CQL (
         Table(..),
         PreparedQueryID(..),
         serverStats,
-        ServerStat(..)
+        ServerStat(..),
+        PoolConfig(..),
     ) where
 
 import Control.Applicative
@@ -250,14 +253,21 @@ instance Ord ServerState where
 
 
 data PoolConfig = PoolConfig {
+      piServers              :: [Server],
       piKeyspace             :: Keyspace,
       piAuth                 :: Maybe Authentication,
-      piServers              :: TVar (Seq.Seq ServerState),
       piSessionCreateTimeout :: NominalDiffTime,
       piConnectionTimeout    :: NominalDiffTime,
       piIoTimeout            :: NominalDiffTime,
-      piBackoffOnError       :: NominalDiffTime
+      piBackoffOnError       :: NominalDiffTime,
+      piMaxSessionIdleTime   :: NominalDiffTime,
+      piMaxSessions          :: Int
     }
+
+data PoolState = PoolState {
+      psConfig  :: PoolConfig,
+      psServers :: TVar (Seq.Seq ServerState)
+}
 
 -- | Exported stats for a server.
 data ServerStat = ServerStat {
@@ -266,7 +276,7 @@ data ServerStat = ServerStat {
       statAvailable    :: Bool 
 } deriving (Show)
 
-newtype Pool = Pool (PoolConfig, P.Pool Session)
+newtype Pool = Pool (PoolState, P.Pool Session)
 
 class MonadCatchIO m => MonadCassandra m where
     getCassandraPool :: m Pool
@@ -287,28 +297,41 @@ instance (MonadCassandra m, Monoid w) => MonadCassandra (Control.Monad.RWS.RWST 
     getCassandraPool = lift getCassandraPool
 
 
+
+defaultConfig :: [Server] -> Keyspace -> Maybe Authentication -> PoolConfig
+defaultConfig servers keyspace auth = PoolConfig {
+                  piServers = servers,
+                  piKeyspace = keyspace,
+                  piAuth = auth,
+                  piSessionCreateTimeout = defaultSessionCreateTimeout,
+                  piConnectionTimeout = defaultConnectionTimeout,
+                  piIoTimeout = defaultIoTimeout,
+                  piBackoffOnError = defaultBackoffOnError,
+                  piMaxSessionIdleTime = defaultMaxSessionIdleTime,
+                  piMaxSessions = defaultMaxSessions
+                }
+
+
 -- | Construct a pool of Cassandra connections.
 newPool :: [Server] -> Keyspace -> Maybe Authentication -> IO Pool
-newPool svrs ks auth = do
-    when (null svrs) $ throwIO $ userError "at least one server required"
+newPool servers keyspace auth = newPool' $ defaultConfig servers keyspace auth
+
+newPool' :: PoolConfig -> IO Pool
+newPool' config@PoolConfig { piServers, piMaxSessions, piMaxSessionIdleTime } = do
+    when (null piServers) $ throwIO $ userError "at least one server required"
 
     -- TODO: Shuffle ordinals
-    let servers = Seq.fromList $ map (\(s, idx) -> ServerState s idx 0 Nothing True) $ zip svrs [0..]
+    let servers = Seq.fromList $ map (\(s, idx) -> ServerState s idx 0 Nothing True) $ zip piServers [0..]
     servers' <- atomically $ newTVar servers
 
-    let poolConfig = PoolConfig {
-          piKeyspace = ks,
-          piAuth = auth,
-          piServers = servers',
-          piSessionCreateTimeout = defaultSessionCreateTimeout,
-          piConnectionTimeout = defaultConnectionTimeout,
-          piIoTimeout = defaultIoTimeout,
-          piBackoffOnError = defaultBackoffOnError
-          }
+    let poolState = PoolState {
+                      psConfig = config,
+                      psServers = servers'
+                    }
 
-    sessions <- P.createPool (newSession poolConfig) (destroySession poolConfig) 1 defaultMaxSessionIdleTime defaultMaxSessions
+    sessions <- P.createPool (newSession poolState) (destroySession poolState) 1 piMaxSessionIdleTime piMaxSessions
 
-    let pool = Pool (poolConfig, sessions)
+    let pool = Pool (poolState, sessions)
 
     _ <- forkIO $ poolWatch pool
 
@@ -316,14 +339,14 @@ newPool svrs ks auth = do
 
 
 poolWatch :: Pool -> IO ()
-poolWatch (Pool (config, _)) = do
+poolWatch (Pool (PoolState { psConfig, psServers }, _)) = do
 
   let loop = do
-        cutoff <- (piBackoffOnError config `addUTCTime`) <$> getCurrentTime
+        cutoff <- (piBackoffOnError psConfig `addUTCTime`) <$> getCurrentTime
 
         debugM "Database.Cassandra.CQL.poolWatch" "starting"
         sleepTil <- atomically $ do
-                          servers <- readTVar (piServers config)
+                          servers <- readTVar psServers
 
                           let availableAgain = filter (((&&) <$> (not . ssAvailable) <*> (maybe False (<= cutoff) . ssLastError)) . snd) (zip [0..] $ F.toList servers)
                               servers' = F.foldr' (\(idx, server) accum -> Seq.update idx server { ssAvailable = True } accum) servers availableAgain
@@ -331,14 +354,14 @@ poolWatch (Pool (config, _)) = do
                                                                then fromJust . ssLastError $ s
                                                                else nwu) cutoff servers'
 
-                          writeTVar (piServers config) servers'
+                          writeTVar psServers servers'
 
                           return nextWakeup
 
 
         delay <- (sleepTil `diffUTCTime`) <$> getCurrentTime
 
-        statusDump <- atomically $ readTVar (piServers config)
+        statusDump <- atomically $ readTVar psServers
         debugM "Database.Cassandra.CQL.poolWatch" $ "completed : delaying for " ++ show delay ++ ", server states : " ++ show statusDump
 
         threadDelay (floor $ delay * 1000000)
@@ -348,15 +371,15 @@ poolWatch (Pool (config, _)) = do
 
 
 serverStats :: Pool -> IO [ServerStat]
-serverStats (Pool (config, _)) = atomically $ do
-                                   servers <- readTVar (piServers config)
+serverStats (Pool (PoolState { psServers }, _)) = atomically $ do
+                                   servers <- readTVar psServers
                                    return $ map (\ServerState { ssServer, ssSessionCount, ssAvailable } -> ServerStat { statServer = ssServer, statSessionCount = ssSessionCount, statAvailable = ssAvailable }) (F.toList servers)
 
                
 
 
-newSession :: PoolConfig -> IO Session
-newSession poolConfig = do
+newSession :: PoolState -> IO Session
+newSession poolState@PoolState { psConfig, psServers } = do
   debugM "Database.Cassandra.CQL.nextSession" "starting"
 
   maskingState <- getMaskingState
@@ -364,7 +387,7 @@ newSession poolConfig = do
 
   startTime <- getCurrentTime
 
-  let giveUpAt = piSessionCreateTimeout poolConfig `addUTCTime` startTime
+  let giveUpAt = piSessionCreateTimeout psConfig `addUTCTime` startTime
 
       loop = do
         timeLeft <- (giveUpAt `diffUTCTime`) <$> getCurrentTime
@@ -388,7 +411,7 @@ newSession poolConfig = do
       makeSession = bracketOnError chooseServer restoreCount setup
 
       chooseServer = atomically $ do
-                             servers <- readTVar (piServers poolConfig)
+                             servers <- readTVar psServers
 
                              let available = filter (ssAvailable . snd) (zip [0..] $ F.toList servers)
 
@@ -398,30 +421,30 @@ newSession poolConfig = do
                                  let (idx, best @ ServerState { ssSessionCount }) = minimumBy (compare `on` snd) available
                                      updatedBest = best { ssSessionCount = ssSessionCount + 1 }
 
-                                 modifyTVar' (piServers poolConfig) (Seq.update idx updatedBest)
+                                 modifyTVar' psServers (Seq.update idx updatedBest)
                                  return (updatedBest, idx)
           
 
       restoreCount (_, idx) = do
                           now <- getCurrentTime
-                          atomically $ modifyTVar' (piServers poolConfig) (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1, ssLastError = Just now, ssAvailable = False }) idx)
+                          atomically $ modifyTVar' psServers (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1, ssLastError = Just now, ssAvailable = False }) idx)
 
 
-      setup (ServerState { ssServer }, idx) = setupConnection poolConfig idx ssServer
+      setup (ServerState { ssServer }, idx) = setupConnection poolState idx ssServer
 
   loop
 
 
 
-destroySession :: PoolConfig -> Session -> IO ()
-destroySession poolConfig Session { sessSocket, sessServerIndex } = mask $ \restore -> do
-                                                                      atomically $ modifyTVar' (piServers poolConfig) (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1 }) sessServerIndex)
-                                                                      restore (sClose sessSocket)
+destroySession :: PoolState -> Session -> IO ()
+destroySession PoolState { psServers } Session { sessSocket, sessServerIndex } = mask $ \restore -> do
+                                                                                   atomically $ modifyTVar' psServers (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1 }) sessServerIndex)
+                                                                                   restore (sClose sessSocket)
   
   
 
-setupConnection :: PoolConfig -> Int -> Server -> IO Session
-setupConnection poolConfig serverIndex server = do
+setupConnection :: PoolState -> Int -> Server -> IO Session
+setupConnection PoolState { psConfig } serverIndex server = do
     let hints = defaultHints { addrSocketType = Stream }
         (host, service) = server
 
@@ -444,14 +467,14 @@ setupConnection poolConfig serverIndex server = do
 
                                       -- No need to use 'bracketOnError' here because we are already masked.
                                       s <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
-                                      mConn <- timeout ((floor $ (piConnectionTimeout poolConfig) * 1000000) :: Int) (connect s (addrAddress ai)) `onException` sClose s
+                                      mConn <- timeout ((floor $ (piConnectionTimeout psConfig) * 1000000) :: Int) (connect s (addrAddress ai)) `onException` sClose s
                                       case mConn of
                                         Nothing -> sClose s >> return Nothing
                                         Just _ -> return $ Just s
 
                            now <- getCurrentTime
                             
-                           if now `diffUTCTime` startTime >= piConnectionTimeout poolConfig
+                           if now `diffUTCTime` startTime >= piConnectionTimeout psConfig
                              then return Nothing
                              else tryConnect `catch` (\ (e :: SomeException) -> do
                                                         debugM "Database.Cassandra.CQL.setupConnection" $ "failed to connect to address " ++ show ai ++ " : " ++ show e
@@ -471,7 +494,7 @@ setupConnection poolConfig serverIndex server = do
                            sessSocket = s
                          }
 
-            evalStateT (introduce poolConfig) (activeSession poolConfig active)
+            evalStateT (introduce psConfig) (activeSession psConfig active)
 
             return active
 
@@ -793,12 +816,12 @@ introduce PoolConfig { piKeyspace, piAuth }  = do
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
-    pool@(Pool (poolConfig, sessions)) <- getCassandraPool
+    pool@(Pool (PoolState { psConfig }, sessions)) <- getCassandraPool
 
     liftIO $ mask $ \restore -> do
                      (session, local') <- P.takeResource sessions
 
-                     a <- restore (evalStateT (code pool) (activeSession poolConfig session))
+                     a <- restore (evalStateT (code pool) (activeSession psConfig session))
                           `catches`
                                 [ Handler $ \(exc :: CassandraException) -> P.putResource local' session >> throwIO exc,
                                   Handler $ \(exc :: SomeException) -> P.destroyResource sessions local' session >> throwIO exc

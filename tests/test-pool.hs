@@ -43,9 +43,16 @@ main :: IO ()
 main = do
   setupLogging
 
-  let auth = Nothing
   -- first server should be unresponsive
-  pool <- newPool [("172.16.0.1", "9042"), ("localhost", "9042")] "test" auth
+  pool <- newPool' (defaultConfig [("172.16.0.1", "9042"), ("localhost", "9042")] "test" Nothing) {
+            piSessionCreateTimeout = 20
+          , piConnectionTimeout = 10
+          , piIoTimeout = 120
+          , piBackoffOnError = 300
+          , piMaxSessionIdleTime = 10
+          , piMaxSessions = 20
+          }
+
   simpleRetry $ runCas pool $ ignoreProtocolError $ liftIO . print =<< executeSchema QUORUM createThings ()
 
   let writeBatch ids = mapM_ (runCas pool . (\id' -> executeWrite QUORUM insertThing (id', pack $ show id'))) ids
@@ -68,7 +75,8 @@ main = do
 
   mapM_ takeMVar joinOn
   
-  threadDelay 130000000
+  -- wait long enough for all idle connections to be destroyed
+  threadDelay 15000000
 
   unfinished <- filter ((/= 0) . statSessionCount) <$> serverStats pool
   unless (null unfinished) $ putStrLn $ "servers with outstanding sessions (should be none) : " ++ show unfinished
