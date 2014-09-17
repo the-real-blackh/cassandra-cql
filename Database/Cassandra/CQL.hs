@@ -128,6 +128,7 @@ module Database.Cassandra.CQL (
         executeWrite,
         executeRows,
         executeRow,
+        executeTrans,
         -- * Value types
         Blob(..),
         Counter(..),
@@ -367,7 +368,7 @@ recvAll s n = do
             return (bs `B.append` bs')
 
 protocolVersion :: Word8
-protocolVersion = 1
+protocolVersion = 2
 
 recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
 recvFrame qt = do
@@ -1348,6 +1349,8 @@ executeInternal query i cons = do
         Right values -> return values
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
+        putElt cons
+        putWord8 0x01
         putWord16be (fromIntegral $ length values)
         forM_ values $ \mValue ->
             case mValue of
@@ -1356,7 +1359,6 @@ executeInternal query i cons = do
                     let enc = encodeCas value
                     putWord32be (fromIntegral $ B.length enc)
                     putByteString enc
-        putElt cons
     fr <- recvFrame (queryText query)
     case frOpcode fr of
         RESULT -> decodeEltM "RESULT" (frBody fr) (queryText query)
@@ -1373,6 +1375,20 @@ executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
         RowsResult meta rows -> decodeRows q meta rows
+        _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+
+-- | Execute a lightweight transaction
+executeTrans :: (MonadCassandra m, CasValues i) =>
+                Query Write i () -- ^ CQL query to execute
+             -> i                -- ^ Input values substituted in the query
+             -> m Bool
+executeTrans q i = do
+    res <- executeRaw q i ONE
+    case res of
+        RowsResult _ ((el:row):rows) ->
+          case decodeCas $ fromJust el of
+            Left s -> error $ "executeTrans: decode result failure=" ++ s
+            Right b -> return b
         _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row

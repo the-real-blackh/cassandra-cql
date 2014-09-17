@@ -1,11 +1,12 @@
 name:                cassandra-cql
-version:             0.4.0.1
+version:             0.4.0.2
 synopsis:            Haskell client for Cassandra's CQL protocol
 description:
   Haskell client for Cassandra's CQL protocol
   .
   Revision history: 0.3.0.1 Fix socket issue on Mac.
   0.4.0.1 Add PasswordAuthenticator (thanks Curtis Carter) & accept ghc-7.8
+  0.4.0.2 Utilize new CQL driver; Add support for lightweight transactions.
 license:             BSD3
 license-file:        LICENSE
 author:              Stephen Blackheath
