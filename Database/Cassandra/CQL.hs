@@ -198,6 +198,7 @@ import Numeric
 import Unsafe.Coerce
 import Data.Function (on)
 import Data.Monoid ((<>))
+import Data.Fixed (Pico)
 import System.Timeout (timeout)
 import System.Log.Logger (debugM, warningM)
 
@@ -1058,10 +1059,10 @@ epoch = UTCTime (fromGregorian 1970 1 1) 0
 instance CasType UTCTime where
     getCas = do
         ms <- getWord64be
-        let difft = realToFrac $ (fromIntegral ms :: Double) / 1000
+        let difft = realToFrac $ (fromIntegral ms :: Pico) / 1000
         return $ addUTCTime difft epoch
     putCas utc = do
-        let seconds = realToFrac $ diffUTCTime utc epoch :: Double
+        let seconds = realToFrac $ diffUTCTime utc epoch :: Pico
             ms = round (seconds * 1000) :: Word64
         putWord64be ms
     casType _ = CTimestamp
