@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving, ScopedTypeVariables,
         FlexibleInstances, DeriveDataTypeable, UndecidableInstances,
-        BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures #-}
+        BangPatterns, OverlappingInstances, DataKinds, GADTs, KindSignatures, NamedFieldPuns #-}
 -- | Haskell client for Cassandra's CQL protocol
 --
 -- For examples, take a look at the /tests/ directory in the source archive.
@@ -108,6 +108,8 @@ module Database.Cassandra.CQL (
         Keyspace(..),
         Pool,
         newPool,
+        newPool',
+        defaultConfig,
         -- * Cassandra monad
         MonadCassandra(..),
         Cas,
@@ -143,24 +145,22 @@ module Database.Cassandra.CQL (
         Metadata(..),
         CType(..),
         Table(..),
-        PreparedQueryID(..)
+        PreparedQueryID(..),
+        serverStats,
+        ServerStat(..),
+        PoolConfig(..),
     ) where
 
 import Control.Applicative
-import Control.Concurrent
+import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.STM
-import Control.Exception (IOException, SomeException)
+import Control.Exception (IOException, SomeException, MaskingState(..), throwIO, getMaskingState, mask)
 import Control.Monad.CatchIO
 import Control.Monad.Reader
 import Control.Monad.State hiding (get, put)
-import qualified Control.Monad.State as State
-import qualified Control.Monad.Reader
 import qualified Control.Monad.RWS
-import qualified Control.Monad.State
-import qualified Control.Monad.State.Strict
 import qualified Control.Monad.Error
 import qualified Control.Monad.Writer
-import Control.Monad.Trans
 import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
 import Data.ByteString (ByteString)
@@ -174,49 +174,110 @@ import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
+import qualified Data.Foldable as F
 import Data.Monoid (Monoid)
-import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Serialize hiding (Result)
 import Data.Set (Set)
 import qualified Data.Set as S
-import Foreign.Storable
+import qualified Data.Pool as P
 import Data.String
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Time.Calendar
 import Data.Time.Clock
-import Data.Typeable
+import Data.Typeable ()
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import Data.Word
 import Network.Socket (Socket, HostName, ServiceName, getAddrInfo, socket, AddrInfo(..),
     connect, sClose, SockAddr(..), SocketType(..), defaultHints)
-import Network.Socket.ByteString (send, sendAll, recv)
+import Network.Socket.ByteString (sendAll, recv)
 import Numeric
 import Unsafe.Coerce
---import qualified Data.ByteString.Char8 as C
---import Text.Hexdump
+import Data.Function (on)
+import Data.Monoid ((<>))
+import Data.Fixed (Pico)
+import System.Timeout (timeout)
+import System.Log.Logger (debugM, warningM)
+
+defaultConnectionTimeout :: NominalDiffTime
+defaultConnectionTimeout = 10
+
+defaultIoTimeout :: NominalDiffTime
+defaultIoTimeout = 300
+
+defaultSessionCreateTimeout :: NominalDiffTime
+defaultSessionCreateTimeout = 20
+
+defaultBackoffOnError :: NominalDiffTime
+defaultBackoffOnError = 60
+
+defaultMaxSessionIdleTime :: NominalDiffTime
+defaultMaxSessionIdleTime = 60
+
+defaultMaxSessions :: Int
+defaultMaxSessions = 20
+
 
 type Server = (HostName, ServiceName)
 
 data ActiveSession = ActiveSession {
+        actServer     :: Server,
         actSocket     :: Socket,
+        actIoTimeout  :: NominalDiffTime,
         actQueryCache :: Map QueryID PreparedQuery
     }
 
+
 data Session = Session {
-        sesServer :: Server,
-        sesActive :: Maybe ActiveSession
+      sessServerIndex :: Int,
+      sessServer      :: Server,
+      sessSocket      :: Socket
     }
 
--- | A handle for the state of the connection pool.
-data Pool = Pool {
-        piKeyspace :: Keyspace,
-        piSessions :: TVar (Seq Session),
-        piAuth :: Maybe Authentication
+
+data ServerState = ServerState {
+        ssServer       :: Server,
+        ssOrdinal      :: Int,
+        ssSessionCount :: Int,
+        ssLastError    :: Maybe UTCTime,
+        ssAvailable    :: Bool
+  } deriving (Show, Eq)
+
+instance Ord ServerState where
+  compare = 
+      let compareCount = compare `on` ssSessionCount
+          tieBreaker = compare `on` ssOrdinal
+      in compareCount <> tieBreaker
+
+
+data PoolConfig = PoolConfig {
+      piServers              :: [Server],
+      piKeyspace             :: Keyspace,
+      piAuth                 :: Maybe Authentication,
+      piSessionCreateTimeout :: NominalDiffTime,
+      piConnectionTimeout    :: NominalDiffTime,
+      piIoTimeout            :: NominalDiffTime,
+      piBackoffOnError       :: NominalDiffTime,
+      piMaxSessionIdleTime   :: NominalDiffTime,
+      piMaxSessions          :: Int
     }
+
+data PoolState = PoolState {
+      psConfig  :: PoolConfig,
+      psServers :: TVar (Seq.Seq ServerState)
+}
+
+-- | Exported stats for a server.
+data ServerStat = ServerStat {
+      statServer       :: Server,
+      statSessionCount :: Int,
+      statAvailable    :: Bool 
+} deriving (Show)
+
+newtype Pool = Pool (PoolState, P.Pool Session)
 
 class MonadCatchIO m => MonadCassandra m where
     getCassandraPool :: m Pool
@@ -236,60 +297,210 @@ instance (MonadCassandra m, Monoid a) => MonadCassandra (Control.Monad.Writer.Wr
 instance (MonadCassandra m, Monoid w) => MonadCassandra (Control.Monad.RWS.RWST r w s m) where
     getCassandraPool = lift getCassandraPool
 
+
+
+defaultConfig :: [Server] -> Keyspace -> Maybe Authentication -> PoolConfig
+defaultConfig servers keyspace auth = PoolConfig {
+                  piServers = servers,
+                  piKeyspace = keyspace,
+                  piAuth = auth,
+                  piSessionCreateTimeout = defaultSessionCreateTimeout,
+                  piConnectionTimeout = defaultConnectionTimeout,
+                  piIoTimeout = defaultIoTimeout,
+                  piBackoffOnError = defaultBackoffOnError,
+                  piMaxSessionIdleTime = defaultMaxSessionIdleTime,
+                  piMaxSessions = defaultMaxSessions
+                }
+
+
 -- | Construct a pool of Cassandra connections.
 newPool :: [Server] -> Keyspace -> Maybe Authentication -> IO Pool
-newPool svrs ks auth = do
-    let sessions = map (\svr -> Session svr Nothing) svrs
-    sess <- atomically $ newTVar (Seq.fromList sessions)
-    return $ Pool {
-            piKeyspace = ks,
-            piSessions = sess,
-            piAuth = auth
-        }
+newPool servers keyspace auth = newPool' $ defaultConfig servers keyspace auth
 
-takeSession :: Pool -> IO Session
-takeSession pool = atomically $ do
-    sess <- readTVar (piSessions pool)
-    if Seq.null sess
-        then retry
-        else do
-            let ses = sess `Seq.index` 0
-            writeTVar (piSessions pool) (Seq.drop 1 sess)
-            return ses
+newPool' :: PoolConfig -> IO Pool
+newPool' config@PoolConfig { piServers, piMaxSessions, piMaxSessionIdleTime } = do
+    when (null piServers) $ throwIO $ userError "at least one server required"
 
-putSession :: Pool -> Session -> IO ()
-putSession pool ses = atomically $ modifyTVar (piSessions pool) (|> ses)
+    -- TODO: Shuffle ordinals
+    let servers = Seq.fromList $ map (\(s, idx) -> ServerState s idx 0 Nothing True) $ zip piServers [0..]
+    servers' <- atomically $ newTVar servers
 
-connectIfNeeded :: Pool -> Maybe Authentication -> Session -> IO Session
-connectIfNeeded pool auth session =
-    if isJust (sesActive session)
-        then return session
-        else do
-            let hints = defaultHints { addrSocketType = Stream }
-            let (host, service) = sesServer session
-            ais <- getAddrInfo (Just hints) (Just host) (Just service)
-            mSocket <- foldM (\mSocket ai -> do
-                    case mSocket of
-                        Nothing -> do
-                            s <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
-                            do
-                                connect s (addrAddress ai)
-                                return (Just s)
-                              `catch` \(exc :: IOException) -> do
-                                sClose s
-                                return Nothing
-                        Just _ -> return mSocket
-                ) Nothing ais
-            case mSocket of
-                Just socket -> do
-                    let active = ActiveSession {
-                                actSocket = socket,
-                                actQueryCache = M.empty
-                            }
-                    active' <- execStateT (introduce pool auth) active
-                    return $ session { sesActive = Just active' }
-                Nothing ->
-                    return session
+    let poolState = PoolState {
+                      psConfig = config,
+                      psServers = servers'
+                    }
+
+    sessions <- P.createPool (newSession poolState) (destroySession poolState) 1 piMaxSessionIdleTime piMaxSessions
+
+    let pool = Pool (poolState, sessions)
+
+    _ <- forkIO $ poolWatch pool
+
+    return pool
+
+
+poolWatch :: Pool -> IO ()
+poolWatch (Pool (PoolState { psConfig, psServers }, _)) = do
+
+  let loop = do
+        cutoff <- (piBackoffOnError psConfig `addUTCTime`) <$> getCurrentTime
+
+        debugM "Database.Cassandra.CQL.poolWatch" "starting"
+        sleepTil <- atomically $ do
+                          servers <- readTVar psServers
+
+                          let availableAgain = filter (((&&) <$> (not . ssAvailable) <*> (maybe False (<= cutoff) . ssLastError)) . snd) (zip [0..] $ F.toList servers)
+                              servers' = F.foldr' (\(idx, server) accum -> Seq.update idx server { ssAvailable = True } accum) servers availableAgain
+                              nextWakeup = F.foldr' (\s nwu -> if not (ssAvailable s) && maybe False (<= nwu) (ssLastError s)
+                                                               then fromJust . ssLastError $ s
+                                                               else nwu) cutoff servers'
+
+                          writeTVar psServers servers'
+
+                          return nextWakeup
+
+
+        delay <- (sleepTil `diffUTCTime`) <$> getCurrentTime
+
+        statusDump <- atomically $ readTVar psServers
+        debugM "Database.Cassandra.CQL.poolWatch" $ "completed : delaying for " ++ show delay ++ ", server states : " ++ show statusDump
+
+        threadDelay (floor $ delay * 1000000)
+        loop
+
+  loop
+
+
+serverStats :: Pool -> IO [ServerStat]
+serverStats (Pool (PoolState { psServers }, _)) = atomically $ do
+                                   servers <- readTVar psServers
+                                   return $ map (\ServerState { ssServer, ssSessionCount, ssAvailable } -> ServerStat { statServer = ssServer, statSessionCount = ssSessionCount, statAvailable = ssAvailable }) (F.toList servers)
+
+               
+
+
+newSession :: PoolState -> IO Session
+newSession poolState@PoolState { psConfig, psServers } = do
+  debugM "Database.Cassandra.CQL.nextSession" "starting"
+
+  maskingState <- getMaskingState
+  when (maskingState == Unmasked) $ throwIO $ userError "caller MUST mask async exceptions before attempting to create a session"
+
+  startTime <- getCurrentTime
+
+  let giveUpAt = piSessionCreateTimeout psConfig `addUTCTime` startTime
+
+      loop = do
+        timeLeft <- (giveUpAt `diffUTCTime`) <$> getCurrentTime
+
+        when (timeLeft <= 0) $ throwIO NoAvailableServers
+
+        debugM "Database.Cassandra.CQL.newSession" "starting attempt to create a new session"
+        sessionZ <- timeout ((floor $ timeLeft * 1000000) :: Int) makeSession
+                    `catches` [ Handler $ (\(e :: CassandraCommsError) -> do 
+                                             warningM "Database.Cassandra.CQL.newSession" $ "failed to create a session due to temporary error (will retry) : " ++ show e
+                                             return Nothing),
+                                Handler $ (\(e :: SomeException) -> do
+                                             warningM "Database.Cassandra.CQL.newSession" $ "failed to create a session due to permanent error (will rethrow) : " ++ show e
+                                             throwIO e)
+                              ]
+
+        case sessionZ of
+          Just session -> return session
+          Nothing -> loop
+
+      makeSession = bracketOnError chooseServer restoreCount setup
+
+      chooseServer = atomically $ do
+                             servers <- readTVar psServers
+
+                             let available = filter (ssAvailable . snd) (zip [0..] $ F.toList servers)
+
+                             if null available
+                               then retry
+                               else do
+                                 let (idx, best @ ServerState { ssSessionCount }) = minimumBy (compare `on` snd) available
+                                     updatedBest = best { ssSessionCount = ssSessionCount + 1 }
+
+                                 modifyTVar' psServers (Seq.update idx updatedBest)
+                                 return (updatedBest, idx)
+          
+
+      restoreCount (_, idx) = do
+                          now <- getCurrentTime
+                          atomically $ modifyTVar' psServers (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1, ssLastError = Just now, ssAvailable = False }) idx)
+
+
+      setup (ServerState { ssServer }, idx) = setupConnection poolState idx ssServer
+
+  loop
+
+
+
+destroySession :: PoolState -> Session -> IO ()
+destroySession PoolState { psServers } Session { sessSocket, sessServerIndex } = mask $ \restore -> do
+                                                                                   atomically $ modifyTVar' psServers (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1 }) sessServerIndex)
+                                                                                   restore (sClose sessSocket)
+  
+  
+
+setupConnection :: PoolState -> Int -> Server -> IO Session
+setupConnection PoolState { psConfig } serverIndex server = do
+    let hints = defaultHints { addrSocketType = Stream }
+        (host, service) = server
+
+    debugM "Database.Cassandra.CQL.setupConnection" $ "attempting to connect to " ++ host
+
+    startTime <- getCurrentTime
+
+    ais <- getAddrInfo (Just hints) (Just host) (Just service)
+
+    bracketOnError (connectSocket startTime ais) (maybe (return ()) sClose) buildSession
+
+    where connectSocket startTime ais = 
+              foldM (\mSocket ai -> do
+                       case mSocket of
+
+                         Nothing -> do
+
+                           let tryConnect = do
+                                      debugM "Database.Cassandra.CQL.setupConnection" $ "trying address " ++ show ai
+
+                                      -- No need to use 'bracketOnError' here because we are already masked.
+                                      s <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
+                                      mConn <- timeout ((floor $ (piConnectionTimeout psConfig) * 1000000) :: Int) (connect s (addrAddress ai)) `onException` sClose s
+                                      case mConn of
+                                        Nothing -> sClose s >> return Nothing
+                                        Just _ -> return $ Just s
+
+                           now <- getCurrentTime
+                            
+                           if now `diffUTCTime` startTime >= piConnectionTimeout psConfig
+                             then return Nothing
+                             else tryConnect `catch` (\ (e :: SomeException) -> do
+                                                        debugM "Database.Cassandra.CQL.setupConnection" $ "failed to connect to address " ++ show ai ++ " : " ++ show e
+                                                        return Nothing
+                                                     )
+
+                         Just _ -> return mSocket
+                    ) Nothing ais
+
+
+          buildSession (Just s) = do
+            debugM "Database.Cassandra.CQL.setupConnection" $ "made connection, now attempting setup for socket " ++ show s
+
+            let active = Session {
+                           sessServerIndex = serverIndex,
+                           sessServer = server,
+                           sessSocket = s
+                         }
+
+            evalStateT (introduce psConfig) (activeSession psConfig active)
+
+            return active
+
+          buildSession Nothing = throwIO NoAvailableServers
+          
 
 data Flag = Compression | Tracing
     deriving Show
@@ -348,22 +559,25 @@ instance Serialize Opcode where
             _    -> fail $ "unknown opcode 0x"++showHex w ""
 
 data Frame a = Frame {
-        frFlags :: [Flag],
-        frStream :: Int8,
-        frOpcode :: Opcode,
-        frBody   :: a
+        _frFlags  :: [Flag],
+        _frStream :: Int8,
+        frOpcode  :: Opcode,
+        frBody    :: a
     }
     deriving Show
 
-recvAll :: Socket -> Int -> IO ByteString
-recvAll s n = do
+timeout' :: NominalDiffTime -> IO a -> IO a
+timeout' to = timeout (floor $ to * 1000000) >=> maybe (throwIO CoordinatorTimeout) return
+
+recvAll :: NominalDiffTime -> Socket -> Int -> IO ByteString
+recvAll ioTimeout s n = timeout' ioTimeout $ do
     bs <- recv s n
     when (B.null bs) $ throw ShortRead
     let left = n - B.length bs
     if left == 0
         then return bs
         else do
-            bs' <- recvAll s left
+            bs' <- recvAll ioTimeout s left
             return (bs `B.append` bs')
 
 protocolVersion :: Word8
@@ -372,7 +586,8 @@ protocolVersion = 1
 recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
 recvFrame qt = do
     s <- gets actSocket
-    hdrBs <- liftIO $ recvAll s 8
+    ioTimeout <- gets actIoTimeout
+    hdrBs <- liftIO $ recvAll ioTimeout s 8
     case runGet parseHeader hdrBs of
         Left err -> throw $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
         Right (ver0, flags, stream, opcode, length) -> do
@@ -381,7 +596,7 @@ recvFrame qt = do
                 throw $ LocalProtocolError ("unexpected version " `T.append` T.pack (show ver)) qt
             body <- if length == 0
                 then pure B.empty
-                else liftIO $ recvAll s (fromIntegral length)
+                else liftIO $ recvAll ioTimeout s (fromIntegral length)
             --liftIO $ putStrLn $ hexdump 0 (C.unpack $ hdrBs `B.append` body)
             return $ Frame flags stream opcode body
   `catch` \exc -> throw $ CassandraIOException exc
@@ -395,7 +610,7 @@ recvFrame qt = do
         return (ver, flags, stream, opcode, length)
 
 sendFrame :: Frame ByteString -> StateT ActiveSession IO ()
-sendFrame fr@(Frame flags stream opcode body) = do
+sendFrame (Frame flags stream opcode body) = do
     let bs = runPut $ do
             putWord8 protocolVersion
             putFlags flags
@@ -405,7 +620,8 @@ sendFrame fr@(Frame flags stream opcode body) = do
             putByteString body
     --liftIO $ putStrLn $ hexdump 0 (C.unpack bs)
     s <- gets actSocket
-    liftIO $ sendAll s bs
+    ioTimeout <- gets actIoTimeout
+    liftIO $ timeout' ioTimeout $ sendAll s bs
   `catch` \exc -> throw $ CassandraIOException exc
 
 class ProtoElt a where
@@ -519,6 +735,8 @@ data CassandraCommsError = AuthenticationException Text
                          | ValueMarshallingException TransportDirection Text Text
                          | CassandraIOException IOException
                          | ShortRead
+                         | NoAvailableServers
+                         | CoordinatorTimeout
     deriving (Show, Typeable)
 
 instance Exception CassandraCommsError
@@ -577,20 +795,20 @@ authenticate auth = do
     ERROR -> throwError qt (frBody fr2)
     op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
-introduce :: Pool -> Maybe Authentication -> StateT ActiveSession IO ()
-introduce pool auth = do
+introduce :: PoolConfig -> StateT ActiveSession IO ()
+introduce PoolConfig { piKeyspace, piAuth }  = do
     let qt = "<startup>"
     sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
     fr <- recvFrame qt
     case frOpcode fr of
       AUTHENTICATE -> maybe
         (throw $ MissingAuthenticationError "introduce: server expects auth but none provided" "<credentials>")
-        authenticate auth
+        authenticate piAuth
       READY -> return ()
       ERROR -> throwError qt (frBody fr)
       op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
-    let Keyspace ksName = piKeyspace pool
+    let Keyspace ksName = piKeyspace
     let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
     case res of
@@ -599,31 +817,28 @@ introduce pool auth = do
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
-    pool <- getCassandraPool
-    let auth = piAuth pool
-    mA <- liftIO $ do
-        session <- connectIfNeeded pool auth =<< takeSession pool
-        case sesActive session of
-            Just active -> do
-                (a, active') <- runStateT (code pool) active
-                putSession pool $ session { sesActive = Just active' }
-                return (Just a)
-              `catches` [
-                -- Close the session if we get any IOException
-                Handler $ \(exc :: IOException) -> do
-                    sClose (actSocket active)
-                    putSession pool $ session { sesActive = Nothing }
-                    throw exc,
-                Handler $ \(exc :: SomeException) -> do
-                    putSession pool session
-                    throw exc
-              ]
-            Nothing -> do
-                putSession pool session
-                return Nothing
-    case mA of
-        Just a -> return a
-        Nothing -> withSession code -- Try again until we succeed
+    pool@(Pool (PoolState { psConfig }, sessions)) <- getCassandraPool
+
+    liftIO $ mask $ \restore -> do
+                     (session, local') <- P.takeResource sessions
+
+                     a <- restore (evalStateT (code pool) (activeSession psConfig session))
+                          `catches`
+                                [ Handler $ \(exc :: CassandraException) -> P.putResource local' session >> throwIO exc,
+                                  Handler $ \(exc :: SomeException) -> P.destroyResource sessions local' session >> throwIO exc
+                                ]
+
+                     P.putResource local' session
+
+                     return a
+
+activeSession :: PoolConfig -> Session -> ActiveSession
+activeSession poolConfig session = ActiveSession {
+                                     actServer = sessServer session,
+                                     actSocket = sessSocket session,
+                                     actIoTimeout = piIoTimeout poolConfig,
+                                     actQueryCache = M.empty
+                                   }
 
 -- | The name of a Cassandra keyspace. See the Cassandra documentation for more
 -- information.
@@ -844,10 +1059,10 @@ epoch = UTCTime (fromGregorian 1970 1 1) 0
 instance CasType UTCTime where
     getCas = do
         ms <- getWord64be
-        let difft = realToFrac $ (fromIntegral ms :: Double) / 1000
+        let difft = realToFrac $ (fromIntegral ms :: Pico) / 1000
         return $ addUTCTime difft epoch
     putCas utc = do
-        let seconds = realToFrac $ diffUTCTime utc epoch :: Double
+        let seconds = realToFrac $ diffUTCTime utc epoch :: Pico
             ms = round (seconds * 1000) :: Word64
         putWord64be ms
     casType _ = CTimestamp
@@ -1342,7 +1557,7 @@ executeRaw query i cons = withSession (\_ -> executeInternal query i cons)
 executeInternal :: CasValues values =>
                    Query style any_i any_o -> values -> Consistency -> StateT ActiveSession IO (Result [Maybe ByteString])
 executeInternal query i cons = do
-    pq@(PreparedQuery pqid queryMeta) <- prepare query
+    (PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
         Left err -> throw $ ValueMarshallingException TransportSending (T.pack $ show err) (queryText query)
         Right values -> return values
