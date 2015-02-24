@@ -130,6 +130,7 @@ module Database.Cassandra.CQL (
         executeWrite,
         executeRows,
         executeRow,
+        executeTrans,
         -- * Value types
         Blob(..),
         Counter(..),
@@ -247,7 +248,7 @@ data ServerState = ServerState {
   } deriving (Show, Eq)
 
 instance Ord ServerState where
-  compare = 
+  compare =
       let compareCount = compare `on` ssSessionCount
           tieBreaker = compare `on` ssOrdinal
       in compareCount <> tieBreaker
@@ -274,7 +275,7 @@ data PoolState = PoolState {
 data ServerStat = ServerStat {
       statServer       :: Server,
       statSessionCount :: Int,
-      statAvailable    :: Bool 
+      statAvailable    :: Bool
 } deriving (Show)
 
 newtype Pool = Pool (PoolState, P.Pool Session)
@@ -376,7 +377,7 @@ serverStats (Pool (PoolState { psServers }, _)) = atomically $ do
                                    servers <- readTVar psServers
                                    return $ map (\ServerState { ssServer, ssSessionCount, ssAvailable } -> ServerStat { statServer = ssServer, statSessionCount = ssSessionCount, statAvailable = ssAvailable }) (F.toList servers)
 
-               
+
 
 
 newSession :: PoolState -> IO Session
@@ -397,7 +398,7 @@ newSession poolState@PoolState { psConfig, psServers } = do
 
         debugM "Database.Cassandra.CQL.newSession" "starting attempt to create a new session"
         sessionZ <- timeout ((floor $ timeLeft * 1000000) :: Int) makeSession
-                    `catches` [ Handler $ (\(e :: CassandraCommsError) -> do 
+                    `catches` [ Handler $ (\(e :: CassandraCommsError) -> do
                                              warningM "Database.Cassandra.CQL.newSession" $ "failed to create a session due to temporary error (will retry) : " ++ show e
                                              return Nothing),
                                 Handler $ (\(e :: SomeException) -> do
@@ -424,7 +425,7 @@ newSession poolState@PoolState { psConfig, psServers } = do
 
                                  modifyTVar' psServers (Seq.update idx updatedBest)
                                  return (updatedBest, idx)
-          
+
 
       restoreCount (_, idx) = do
                           now <- getCurrentTime
@@ -441,8 +442,8 @@ destroySession :: PoolState -> Session -> IO ()
 destroySession PoolState { psServers } Session { sessSocket, sessServerIndex } = mask $ \restore -> do
                                                                                    atomically $ modifyTVar' psServers (Seq.adjust (\s -> s { ssSessionCount = ssSessionCount s - 1 }) sessServerIndex)
                                                                                    restore (sClose sessSocket)
-  
-  
+
+
 
 setupConnection :: PoolState -> Int -> Server -> IO Session
 setupConnection PoolState { psConfig } serverIndex server = do
@@ -457,7 +458,7 @@ setupConnection PoolState { psConfig } serverIndex server = do
 
     bracketOnError (connectSocket startTime ais) (maybe (return ()) sClose) buildSession
 
-    where connectSocket startTime ais = 
+    where connectSocket startTime ais =
               foldM (\mSocket ai -> do
                        case mSocket of
 
@@ -474,7 +475,7 @@ setupConnection PoolState { psConfig } serverIndex server = do
                                         Just _ -> return $ Just s
 
                            now <- getCurrentTime
-                            
+
                            if now `diffUTCTime` startTime >= piConnectionTimeout psConfig
                              then return Nothing
                              else tryConnect `catch` (\ (e :: SomeException) -> do
@@ -500,7 +501,7 @@ setupConnection PoolState { psConfig } serverIndex server = do
             return active
 
           buildSession Nothing = throwIO NoAvailableServers
-          
+
 
 data Flag = Compression | Tracing
     deriving Show
@@ -581,7 +582,7 @@ recvAll ioTimeout s n = timeout' ioTimeout $ do
             return (bs `B.append` bs')
 
 protocolVersion :: Word8
-protocolVersion = 1
+protocolVersion = 2
 
 recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
 recvFrame qt = do
@@ -1523,7 +1524,7 @@ instance (CasType a, CasType b, CasType c, CasType d, CasType e,
         (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)) <$> decodeNested 0 vs
 
 -- | Cassandra consistency level. See the Cassandra documentation for an explanation.
-data Consistency = ANY | ONE | TWO | THREE | QUORUM | ALL | LOCAL_QUORUM | EACH_QUORUM
+data Consistency = ANY | ONE | TWO | THREE | QUORUM | ALL | LOCAL_QUORUM | EACH_QUORUM | SERIAL | LOCAL_SERIAL | LOCAL_ONE
     deriving (Eq, Ord, Show, Bounded, Enum)
 
 instance ProtoElt Consistency where
@@ -1536,6 +1537,9 @@ instance ProtoElt Consistency where
         ALL          -> 0x0005
         LOCAL_QUORUM -> 0x0006
         EACH_QUORUM  -> 0x0007
+        SERIAL       -> 0x0008
+        LOCAL_SERIAL -> 0x0009
+        LOCAL_ONE    -> 0x000A
     getElt = do
         w <- getWord16be
         case w of
@@ -1547,6 +1551,9 @@ instance ProtoElt Consistency where
             0x0005 -> pure ALL
             0x0006 -> pure LOCAL_QUORUM
             0x0007 -> pure EACH_QUORUM
+            0x0008 -> pure SERIAL
+            0x0009 -> pure LOCAL_SERIAL
+            0x000A -> pure LOCAL_ONE
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
 -- | A low-level function in case you need some rarely-used capabilities.
@@ -1563,6 +1570,8 @@ executeInternal query i cons = do
         Right values -> return values
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
+        putElt cons
+        putWord8 0x01
         putWord16be (fromIntegral $ length values)
         forM_ values $ \mValue ->
             case mValue of
@@ -1571,7 +1580,6 @@ executeInternal query i cons = do
                     let enc = encodeCas value
                     putWord32be (fromIntegral $ B.length enc)
                     putByteString enc
-        putElt cons
     fr <- recvFrame (queryText query)
     case frOpcode fr of
         RESULT -> decodeEltM "RESULT" (frBody fr) (queryText query)
@@ -1588,6 +1596,20 @@ executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
         RowsResult meta rows -> decodeRows q meta rows
+        _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+
+-- | Execute a lightweight transaction
+executeTrans :: (MonadCassandra m, CasValues i) =>
+                Query Write i () -- ^ CQL query to execute
+             -> i                -- ^ Input values substituted in the query
+             -> m Bool
+executeTrans q i = do
+    res <- executeRaw q i SERIAL
+    case res of
+        RowsResult _ ((el:row):rows) ->
+          case decodeCas $ fromJust el of
+            Left s -> error $ "executeTrans: decode result failure=" ++ s
+            Right b -> return b
         _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row
