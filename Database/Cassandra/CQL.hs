@@ -75,8 +75,9 @@
 --
 -- * 'Rows' for selects that give a list of rows in response.
 --
--- The functions to use for these query types are 'executeSchema', 'executeWrite' and
--- 'executeRows' or 'executeRow' respectively.
+-- The functions to use for these query types are 'executeSchema',
+-- 'executeWrite', 'executeTrans' and 'executeRows' or 'executeRow'
+-- respectively.
 --
 -- The following pattern seems to work very well, especially along with your own 'CasType'
 -- instances, because it gives you a place to neatly add marshalling details that keeps
@@ -96,11 +97,9 @@
 --
 -- /To do/
 --
--- * Add credentials.
---
--- * Improve connection pooling.
---
 -- * Add the ability to easily run queries in parallel.
+-- * Add support for batch queries.
+-- * Add support for query paging.
 
 module Database.Cassandra.CQL (
         -- * Initialization
@@ -786,7 +785,9 @@ throwError qt bs = do
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
 
-data Authentication = PasswordAuthenticator String String
+type UserId = String
+type Password = String
+data Authentication = PasswordAuthenticator UserId Password
 type Credentials = Long ByteString
 
 authCredentials :: Authentication -> Credentials
@@ -1594,7 +1595,7 @@ executeInternal query i cons = do
 
 -- | Execute a query that returns rows.
 executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
-               Consistency
+               Consistency     -- ^ Consistency level of the operation
             -> Query Rows i o  -- ^ CQL query to execute
             -> i               -- ^ Input values substituted in the query
             -> m [o]
@@ -1604,7 +1605,8 @@ executeRows cons q i = do
         RowsResult meta rows -> decodeRows q meta rows
         _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
--- | Execute a lightweight transaction
+-- | Execute a lightweight transaction. The consistency level is implicit and
+-- is SERIAL.
 executeTrans :: (MonadCassandra m, CasValues i) =>
                 Query Write i () -- ^ CQL query to execute
              -> i                -- ^ Input values substituted in the query
@@ -1621,7 +1623,7 @@ executeTrans q i = do
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row
 -- to be returned.
 executeRow :: (MonadCassandra m, CasValues i, CasValues o) =>
-              Consistency
+              Consistency     -- ^ Consistency level of the operation
            -> Query Rows i o  -- ^ CQL query to execute
            -> i               -- ^ Input values substituted in the query
            -> m (Maybe o)
@@ -1640,7 +1642,7 @@ decodeRows query meta rows0 = do
 
 -- | Execute a write operation that returns void.
 executeWrite :: (MonadCassandra m, CasValues i) =>
-                Consistency
+                Consistency       -- ^ Consistency level of the operation
              -> Query Write i ()  -- ^ CQL query to execute
              -> i                 -- ^ Input values substituted in the query
              -> m ()
@@ -1652,7 +1654,7 @@ executeWrite cons q i = do
 
 -- | Execute a schema change, such as creating or dropping a table.
 executeSchema :: (MonadCassandra m, CasValues i) =>
-                 Consistency
+                 Consistency        -- ^ Consistency level of the operation
               -> Query Schema i ()  -- ^ CQL query to execute
               -> i                  -- ^ Input values substituted in the query
               -> m (Change, Keyspace, Table)
