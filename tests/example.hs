@@ -33,7 +33,7 @@ ignoreDropFailure code = code `catch` \exc -> case exc of
     _               -> throw exc
 
 main = do
-    --let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
+    -- let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
     let auth = Nothing
     {-
     Assuming a 'test' keyspace already exists. Here's some CQL to create it:

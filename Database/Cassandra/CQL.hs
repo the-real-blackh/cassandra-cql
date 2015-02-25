@@ -165,6 +165,7 @@ import qualified Control.Monad.Writer
 import Crypto.Hash (hash, Digest, SHA1)
 import Data.Bits
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as C8BS
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import Data.Data
@@ -522,41 +523,48 @@ getFlags = do
         3 -> [Compression, Tracing]
         _ -> error "recvFrame impossible"
 
-data Opcode = ERROR | STARTUP | READY | AUTHENTICATE | CREDENTIALS | OPTIONS |
-              SUPPORTED | QUERY | RESULT | PREPARE | EXECUTE | REGISTER | EVENT
+data Opcode = ERROR | STARTUP | READY | AUTHENTICATE | OPTIONS | SUPPORTED
+            | QUERY | RESULT | PREPARE | EXECUTE | REGISTER | EVENT | BATCH
+            | AUTH_CHALLENGE | AUTH_RESPONSE | AUTH_SUCCESS
     deriving (Eq, Show)
 
 instance Serialize Opcode where
     put op = putWord8 $ case op of
-        ERROR        -> 0x00
-        STARTUP      -> 0x01
-        READY        -> 0x02
-        AUTHENTICATE -> 0x03
-        CREDENTIALS  -> 0x04
-        OPTIONS      -> 0x05
-        SUPPORTED    -> 0x06
-        QUERY        -> 0x07
-        RESULT       -> 0x08
-        PREPARE      -> 0x09
-        EXECUTE      -> 0x0a
-        REGISTER     -> 0x0b
-        EVENT        -> 0x0c
+        ERROR           -> 0x00
+        STARTUP         -> 0x01
+        READY           -> 0x02
+        AUTHENTICATE    -> 0x03
+        OPTIONS         -> 0x05
+        SUPPORTED       -> 0x06
+        QUERY           -> 0x07
+        RESULT          -> 0x08
+        PREPARE         -> 0x09
+        EXECUTE         -> 0x0a
+        REGISTER        -> 0x0b
+        EVENT           -> 0x0c
+        BATCH           -> 0x0d
+        AUTH_CHALLENGE  -> 0x0e
+        AUTH_RESPONSE   -> 0x0f
+        AUTH_SUCCESS    -> 0x10
     get = do
         w <- getWord8
         case w of
-            0x00 -> return $ ERROR
-            0x01 -> return $ STARTUP
-            0x02 -> return $ READY
-            0x03 -> return $ AUTHENTICATE
-            0x04 -> return $ CREDENTIALS
-            0x05 -> return $ OPTIONS
-            0x06 -> return $ SUPPORTED
-            0x07 -> return $ QUERY
-            0x08 -> return $ RESULT
-            0x09 -> return $ PREPARE
-            0x0a -> return $ EXECUTE
-            0x0b -> return $ REGISTER
-            0x0c -> return $ EVENT
+            0x00 -> return ERROR
+            0x01 -> return STARTUP
+            0x02 -> return READY
+            0x03 -> return AUTHENTICATE
+            0x05 -> return OPTIONS
+            0x06 -> return SUPPORTED
+            0x07 -> return QUERY
+            0x08 -> return RESULT
+            0x09 -> return PREPARE
+            0x0a -> return EXECUTE
+            0x0b -> return REGISTER
+            0x0c -> return EVENT
+            0x0d -> return BATCH
+            0x0e -> return AUTH_CHALLENGE
+            0x0f -> return AUTH_RESPONSE
+            0x10 -> return AUTH_SUCCESS
             _    -> fail $ "unknown opcode 0x"++showHex w ""
 
 data Frame a = Frame {
@@ -778,21 +786,19 @@ throwError qt bs = do
             _      -> fail $ "unknown error code 0x"++showHex code ""
 
 
-type User = T.Text
-type Password = T.Text
-data Authentication = PasswordAuthenticator User Password
-type Credentials = [(Text, Text)]
+data Authentication = PasswordAuthenticator String String
+type Credentials = Long ByteString
 
 authCredentials :: Authentication -> Credentials
-authCredentials (PasswordAuthenticator user password) = [("username", user), ("password", password)]
+authCredentials (PasswordAuthenticator user password) = Long $ C8BS.pack $ "\0" ++ user ++ "\0" ++ password
 
 authenticate :: Authentication -> StateT ActiveSession IO ()
 authenticate auth = do
-  let qt = "<credentials>"
-  sendFrame $ Frame [] 0 CREDENTIALS $ encodeElt $ authCredentials auth
+  let qt = "<auth_response>"
+  sendFrame $ Frame [] 0 AUTH_RESPONSE $ encodeElt $ authCredentials auth
   fr2 <- recvFrame qt
   case frOpcode fr2 of
-    READY -> return ()
+    AUTH_SUCCESS -> return ()
     ERROR -> throwError qt (frBody fr2)
     op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
