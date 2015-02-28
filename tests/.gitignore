@@ -1,8 +1,10 @@
 example
+example-trans
 test-double
 test-float
 test-inet
 test-list
+test-pool
 test-set
 test-map
 test-timestamp
