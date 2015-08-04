@@ -257,6 +257,7 @@ instance Ord ServerState where
 data PoolConfig = PoolConfig {
       piServers              :: [Server],
       piKeyspace             :: Keyspace,
+      piKeyspaceConfig       :: Maybe Text,
       piAuth                 :: Maybe Authentication,
       piSessionCreateTimeout :: NominalDiffTime,
       piConnectionTimeout    :: NominalDiffTime,
@@ -304,6 +305,7 @@ defaultConfig :: [Server] -> Keyspace -> Maybe Authentication -> PoolConfig
 defaultConfig servers keyspace auth = PoolConfig {
                   piServers = servers,
                   piKeyspace = keyspace,
+                  piKeyspaceConfig = Nothing,
                   piAuth = auth,
                   piSessionCreateTimeout = defaultSessionCreateTimeout,
                   piConnectionTimeout = defaultConnectionTimeout,
@@ -742,6 +744,7 @@ data CassandraCommsError = AuthenticationException Text
                          | MissingAuthenticationError Text Text
                          | ValueMarshallingException TransportDirection Text Text
                          | CassandraIOException IOException
+                         | CreateKeyspaceError Text Text
                          | ShortRead
                          | NoAvailableServers
                          | CoordinatorTimeout
@@ -804,7 +807,7 @@ authenticate auth = do
     op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
 introduce :: PoolConfig -> StateT ActiveSession IO ()
-introduce PoolConfig { piKeyspace, piAuth }  = do
+introduce PoolConfig { piKeyspace, piKeyspaceConfig, piAuth }  = do
     let qt = "<startup>"
     sendFrame $ Frame [] 0 STARTUP $ encodeElt $ ([("CQL_VERSION", "3.0.0")] :: [(Text, Text)])
     fr <- recvFrame qt
@@ -817,11 +820,21 @@ introduce PoolConfig { piKeyspace, piAuth }  = do
       op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
     let Keyspace ksName = piKeyspace
+
+    case piKeyspaceConfig of
+      Nothing -> return ()
+      Just cfg -> do
+        let q = query $ cfg :: Query Schema () ()
+        res <- executeInternal q () QUORUM
+        case res of
+          SchemaChange _ _ _ -> return ()
+          _ -> throw $ CreateKeyspaceError ("introduce: failed to create a keyspace: " `T.append` T.pack (show res)) (queryText q)
+
     let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
-        _ -> throw $ LocalProtocolError ("expected SetKeyspace, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throw $ LocalProtocolError ("introduce: expected SetKeyspace, but got " `T.append` T.pack (show res)) (queryText q)
 
 withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
