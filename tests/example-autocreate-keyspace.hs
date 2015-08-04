@@ -32,10 +32,6 @@ ignoreDropFailure code = code `catch` \exc -> case exc of
     Invalid _ _ -> return ()
     _               -> throw exc
 
--- | Construct a pool of Cassandra connections.
-newPool :: [Server] -> Keyspace -> Maybe Authentication -> IO Pool
-newPool servers keyspace auth = newPool' $ defaultConfig servers keyspace auth
-
 main = do
     -- let auth = Just (PasswordAuthenticator "cassandra" "cassandra")
     let auth = Nothing
