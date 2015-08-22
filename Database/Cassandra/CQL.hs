@@ -43,6 +43,10 @@
 --
 -- * set\<a\> - 'Set' b
 --
+-- * tuple<a,b> - '(a,b)
+--
+-- * UDT
+--
 -- ...and you can define your own 'CasType' instances to extend these types, which is
 -- a very powerful way to write your code.
 --
@@ -570,7 +574,7 @@ instance Serialize Opcode where
 
 data Frame a = Frame {
         _frFlags  :: [Flag],
-        _frStream :: Int8,
+        _frStream :: Int16,
         frOpcode  :: Opcode,
         frBody    :: a
     }
@@ -591,13 +595,13 @@ recvAll ioTimeout s n = timeout' ioTimeout $ do
             return (bs `B.append` bs')
 
 protocolVersion :: Word8
-protocolVersion = 2
+protocolVersion = 3
 
 recvFrame :: Text -> StateT ActiveSession IO (Frame ByteString)
 recvFrame qt = do
     s <- gets actSocket
     ioTimeout <- gets actIoTimeout
-    hdrBs <- liftIO $ recvAll ioTimeout s 8
+    hdrBs <- liftIO $ recvAll ioTimeout s 9
     case runGet parseHeader hdrBs of
         Left err -> throw $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
         Right (ver0, flags, stream, opcode, length) -> do
@@ -614,7 +618,7 @@ recvFrame qt = do
     parseHeader = do
         ver <- getWord8
         flags <- getFlags
-        stream <- fromIntegral <$> getWord8
+        stream <- fromIntegral <$> getWord16be
         opcode <- get
         length <- getWord32be
         return (ver, flags, stream, opcode, length)
@@ -624,7 +628,7 @@ sendFrame (Frame flags stream opcode body) = do
     let bs = runPut $ do
             putWord8 protocolVersion
             putFlags flags
-            putWord8 (fromIntegral stream)
+            putWord16be (fromIntegral stream)
             put opcode
             putWord32be $ fromIntegral $ B.length body
             putByteString body
@@ -907,6 +911,7 @@ data CType = CCustom Text
            | CMap CType CType
            | CSet CType
            | CMaybe CType
+           | CTuple [CType]
         deriving (Eq)
 
 instance Show CType where
@@ -931,8 +936,10 @@ instance Show CType where
         CMap t1 t2 -> "map<"++show t1++","++show t2++">"
         CSet t -> "set<"++show t++">"
         CMaybe t -> "nullable "++show t
+        CTuple ts -> "tuple<" ++ (intercalate "," $ fmap show ts) ++ ">"
 
 equivalent :: CType -> CType -> Bool
+equivalent (CTuple a) (CTuple b) = all (\ (x,y) -> x `equivalent` y) $ zip a b
 equivalent (CMaybe a) (CMaybe b) = a == b
 equivalent (CMaybe a) b = a == b
 equivalent a (CMaybe b) = a == b
@@ -1138,18 +1145,18 @@ instance CasType SockAddr where
 
 instance CasType a => CasType [a] where
     getCas = do
-        n <- getWord16be
+        n <- getWord32be
         replicateM (fromIntegral n) $ do
-            len <- getWord16be
+            len <- getWord32be
             bs <- getByteString (fromIntegral len)
             case decodeCas bs of
                 Left err -> fail err
                 Right x -> return x
     putCas xs = do
-        putWord16be (fromIntegral $ length xs)
+        putWord32be (fromIntegral $ length xs)
         forM_ xs $ \x -> do
             let bs = encodeCas x
-            putWord16be (fromIntegral $ B.length bs)
+            putWord32be (fromIntegral $ B.length bs)
             putByteString bs
     casType _ = CList (casType (undefined :: a))
 
@@ -1160,14 +1167,14 @@ instance (CasType a, Ord a) => CasType (Set a) where
 
 instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
     getCas = do
-        n <- getWord16be
+        n <- getWord32be
         items <- replicateM (fromIntegral n) $ do
-            len_a <- getWord16be
+            len_a <- getWord32be
             bs_a <- getByteString (fromIntegral len_a)
             a <- case decodeCas bs_a of
                 Left err -> fail err
                 Right x -> return x
-            len_b <- getWord16be
+            len_b <- getWord32be
             bs_b <- getByteString (fromIntegral len_b)
             b <- case decodeCas bs_b of
                 Left err -> fail err
@@ -1176,7 +1183,7 @@ instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
         return $ M.fromList items
     putCas m = do
         let items = M.toList m
-        putWord16be (fromIntegral $ length items)
+        putWord32be (fromIntegral $ length items)
         forM_ items $ \(a,b) -> do
             let bs_a = encodeCas a
             putWord16be (fromIntegral $ B.length bs_a)
@@ -1185,6 +1192,30 @@ instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
             putWord16be (fromIntegral $ B.length bs_b)
             putByteString bs_b
     casType _ = CMap (casType (undefined :: a)) (casType (undefined :: b))
+
+decodeOption :: (CasType a, Show a) => Get a
+decodeOption = do
+  len <- getWord32be
+  bs <- getByteString (fromIntegral len)
+  case decodeCas bs of
+    Left err -> fail err
+    Right x -> return x
+
+encodeOption :: (CasType a, Show a) => a -> Put
+encodeOption x = do
+  let bs = encodeCas x
+  putWord32be (fromIntegral $ B.length bs)
+  putByteString bs
+
+instance (CasType a, CasType b, Show a, Show b) => CasType (a,b) where
+  getCas = do
+    x <- decodeOption
+    y <- decodeOption
+    return (x,y)
+  putCas (x,y) = do
+    encodeOption x
+    encodeOption y
+  casType _ = CTuple [(casType (undefined :: a)), (casType (undefined :: b))]
 
 instance ProtoElt CType where
     putElt _ = error "formatting CType is not implemented"
@@ -1213,6 +1244,7 @@ instance ProtoElt CType where
             0x0020 -> CList <$> getElt
             0x0021 -> CMap <$> getElt <*> getElt
             0x0022 -> CSet <$> getElt
+            0x0031 -> CTuple <$> getElt
             _      -> fail $ "unknown data type code 0x"++showHex op ""
 
 instance ProtoElt Metadata where
@@ -1228,6 +1260,14 @@ instance ProtoElt Metadata where
                 Nothing   -> getElt
             ColumnSpec tSpec <$> getElt <*> getElt
         return $ Metadata cols
+
+instance ProtoElt [CType] where
+  getElt = do
+    n <- getWord16be
+    replicateM (fromIntegral n) getElt
+  putElt x = do
+    putWord16be (fromIntegral $ length x)
+    forM_ x putElt
 
 newtype PreparedQueryID = PreparedQueryID ByteString
     deriving (Eq, Ord, Show, ProtoElt)
