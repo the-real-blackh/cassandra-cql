@@ -58,11 +58,14 @@ test-suite cassandra-cql-test
   type:
     exitcode-stdio-1.0
   main-is:
-    test-tuple.hs
+    Main.hs
   build-depends:
     base                       >= 4.7 && < 5,
     cassandra-cql,
     mtl                        >= 2.1.0,
     random,
+    tasty,
+    tasty-hunit,
     uuid,
+    HUnit,
     MonadCatchIO-transformers
