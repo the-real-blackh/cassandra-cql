@@ -1193,7 +1193,7 @@ instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
             putByteString bs_b
     casType _ = CMap (casType (undefined :: a)) (casType (undefined :: b))
 
-decodeOption :: (CasType a, Show a) => Get a
+decodeOption :: CasType a => Get a
 decodeOption = do
   len <- getWord32be
   bs <- getByteString (fromIntegral len)
@@ -1201,13 +1201,13 @@ decodeOption = do
     Left err -> fail err
     Right x -> return x
 
-encodeOption :: (CasType a, Show a) => a -> Put
+encodeOption :: CasType a => a -> Put
 encodeOption x = do
   let bs = encodeCas x
   putWord32be (fromIntegral $ B.length bs)
   putByteString bs
 
-instance (CasType a, CasType b, Show a, Show b) => CasType (a,b) where
+instance (CasType a, CasType b) => CasType (a,b) where
   getCas = do
     x <- decodeOption
     y <- decodeOption
@@ -1215,7 +1215,49 @@ instance (CasType a, CasType b, Show a, Show b) => CasType (a,b) where
   putCas (x,y) = do
     encodeOption x
     encodeOption y
-  casType _ = CTuple [(casType (undefined :: a)), (casType (undefined :: b))]
+  casType _ = CTuple [casType (undefined :: a), casType (undefined :: b)]
+
+instance (CasType a, CasType b, CasType c) => CasType(a,b,c) where
+  getCas = do
+    x <- decodeOption
+    y <- decodeOption
+    z <- decodeOption
+    return (x,y,z)
+  putCas (x,y,z) = do
+    encodeOption x
+    encodeOption y
+    encodeOption z
+  casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c)]
+
+instance (CasType a,CasType b, CasType c, CasType d) => CasType(a,b,c,d) where
+  getCas = do
+    w <- decodeOption
+    x <- decodeOption
+    y <- decodeOption
+    z <- decodeOption
+    return (w,x,y,z)
+  putCas (w,x,y,z) = do
+    encodeOption w
+    encodeOption x
+    encodeOption y
+    encodeOption z
+  casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c), casType (undefined :: d)]
+
+instance (CasType a,CasType b, CasType c, CasType d, CasType e) => CasType(a,b,c,d,e) where
+  getCas = do
+    v <- decodeOption
+    w <- decodeOption
+    x <- decodeOption
+    y <- decodeOption
+    z <- decodeOption
+    return (v,w,x,y,z)
+  putCas (v,w,x,y,z) = do
+    encodeOption v
+    encodeOption w
+    encodeOption x
+    encodeOption y
+    encodeOption z
+  casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c), casType (undefined :: d), casType (undefined :: e)]
 
 instance ProtoElt CType where
     putElt _ = error "formatting CType is not implemented"

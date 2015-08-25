@@ -66,6 +66,7 @@ test-suite cassandra-cql-test
     random,
     tasty,
     tasty-hunit,
+    text,
     uuid,
     HUnit,
     MonadCatchIO-transformers
