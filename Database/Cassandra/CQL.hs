@@ -1625,6 +1625,74 @@ instance (CasType a, CasType b, CasType c, CasType d, CasType e,
     decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, ())))))))))))))))))))) ->
         (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)) <$> decodeNested 0 vs
 
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, ())))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, ()))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u, CasType v)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u,v) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, (v, ()))))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, (v, ())))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u, CasType v, CasType w)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, (v, (w, ())))))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, (v, (w, ()))))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u, CasType v, CasType w, CasType x)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, (v, (w, (x, ()))))))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, (v, (w, (x, ())))))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u, CasType v, CasType w, CasType x, CasType y)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, (v, (w, (x, (y, ())))))))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, (v, (w, (x, (y, ()))))))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)) <$> decodeNested 0 vs
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f, CasType g, CasType h, CasType i, CasType j,
+          CasType k, CasType l, CasType m, CasType n, CasType o,
+          CasType p, CasType q, CasType r, CasType s, CasType t,
+          CasType u, CasType v, CasType w, CasType x, CasType y,
+          CasType z)
+              => CasValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z) where
+    encodeValues (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t,(u, (v, (w, (x, (y, (z, ()))))))))))))))))))))))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, (g, (h, (i, (j, (k, (l, (m, (n, (o, (p, (q, (r, (s, (t, (u, (v, (w, (x, (y, (z, ())))))))))))))))))))))))))) ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z)) <$> decodeNested 0 vs
+
+
 -- | Cassandra consistency level. See the Cassandra documentation for an explanation.
 data Consistency = ANY | ONE | TWO | THREE | QUORUM | ALL | LOCAL_QUORUM | EACH_QUORUM | SERIAL | LOCAL_SERIAL | LOCAL_ONE
     deriving (Eq, Ord, Show, Bounded, Enum)
