@@ -4,6 +4,8 @@ import Control.Monad.CatchIO
 import Control.Monad.Trans (liftIO)
 import Data.Int
 import qualified Data.List as L
+import Data.Map(Map)
+import qualified Data.Map as M
 import Data.Serialize hiding (Result)
 import Data.Text (Text)
 import Data.UUID
@@ -183,6 +185,40 @@ testUDT = testCase "testUDT" $ cassandraTest $ do
     selectUdt :: Query Rows () (UUID,TestType)
     selectUdt = "select id,item from udt"
 
+testMap :: TestTree
+testMap = testCase "testMap" $ cassandraTest $ do
+  ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropMaps ()
+  liftIO . print =<< executeSchema QUORUM createMaps ()
+
+  u1 <- liftIO randomIO
+  u2 <- liftIO randomIO
+  u3 <- liftIO randomIO
+  let m1 = M.fromList [(1, "one"), (2, "two")]
+      m2 = M.fromList [(100, "hundred"), (200, "two hundred")]
+      m3 = M.fromList [(12, "dozen")]
+  executeWrite QUORUM insert (u1, m1)
+  executeWrite QUORUM insert (u2, m2)
+  executeWrite QUORUM insert (u3, m3)
+
+  results <- executeRows QUORUM select ()
+  liftIO $ do
+    assertBool "Item not found" $ L.elem m1 results
+    assertBool "Item not found" $ L.elem m2 results
+    assertBool "Item not found" $ L.elem m3 results
+
+  where
+    dropMaps :: Query Schema () ()
+    dropMaps = "drop table maps"
+
+    createMaps :: Query Schema () ()
+    createMaps = "create table maps (id uuid PRIMARY KEY, items map<int,text>)"
+
+    insert :: Query Write (UUID, Map Int Text) ()
+    insert = "insert into maps (id, items) values (?, ?)"
+
+    select :: Query Rows () (Map Int Text)
+    select = "select items from maps"
+
 cassandraTest :: Cas () -> IO ()
 cassandraTest action = do
   pool <- newPool [("127.0.0.1", "9042")] "test" Nothing -- servers, keyspace, auth
@@ -196,7 +232,7 @@ ignoreDropFailure code = code `catch` \exc -> case exc of
     _               -> throw exc
 
 allTests :: TestTree
-allTests = testGroup "All Tests" [tupleTests,testUDT]
+allTests = testGroup "All Tests" [tupleTests,testUDT, testMap]
 
 main :: IO ()
 main = defaultMain allTests

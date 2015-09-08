@@ -63,6 +63,7 @@ test-suite cassandra-cql-test
     base                       >= 4.7 && < 5,
     cassandra-cql,
     cereal,
+    containers,
     mtl                        >= 2.1.0,
     random,
     tasty,

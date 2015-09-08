@@ -1193,12 +1193,8 @@ instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
         let items = M.toList m
         putWord32be (fromIntegral $ length items)
         forM_ items $ \(a,b) -> do
-            let bs_a = encodeCas a
-            putWord16be (fromIntegral $ B.length bs_a)
-            putByteString bs_a
-            let bs_b = encodeCas b
-            putWord16be (fromIntegral $ B.length bs_b)
-            putByteString bs_b
+            putOption a
+            putOption b
     casType _ = CMap (casType (undefined :: a)) (casType (undefined :: b))
 
 getString :: Get Text
