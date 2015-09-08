@@ -4,6 +4,7 @@ import Control.Monad.CatchIO
 import Control.Monad.Trans (liftIO)
 import Data.Int
 import qualified Data.List as L
+import Data.Serialize hiding (Result)
 import Data.Text (Text)
 import Data.UUID
 import Database.Cassandra.CQL
@@ -135,6 +136,53 @@ testTuple5 = testCase "testTuple5" $ cassandraTest $ do
     select5 :: Query Rows () (UUID,(Int,Int,Text,Text,Int))
     select5 = "select id,item from tuple5"
 
+{- UDT Tests -}
+
+data TestType = TestType {
+  ttText :: Text,
+  ttInt :: Int
+} deriving (Eq)
+
+instance CasType TestType where
+  getCas = do
+    x <- getOption
+    y <- getOption
+    return $ TestType x y
+  putCas x = do
+    putOption $ ttText x
+    putOption $ ttInt x
+  casType _ = CUDT [CText,CInt]
+
+testUDT :: TestTree
+testUDT = testCase "testUDT" $ cassandraTest $ do
+  ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropUdt ()
+  ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM dropTable ()
+  ignoreDropFailure $ liftIO . print =<< executeSchema QUORUM createUdt ()
+  liftIO . print =<< executeSchema QUORUM createTable ()
+  let x = TestType "test value" 54
+  u1 <- liftIO randomIO
+  executeWrite QUORUM insertUdt (u1,x)
+  results <- executeRows QUORUM selectUdt ()
+  liftIO $ assertBool "Item not found" $ L.elem (u1,x) results
+  where
+    dropTable :: Query Schema () ()
+    dropTable = "drop table udt"
+
+    dropUdt :: Query Schema () ()
+    dropUdt = "drop type testtype"
+
+    createUdt :: Query Schema () ()
+    createUdt = "create type test.testtype(textField text, intField int)"
+
+    createTable :: Query Schema () ()
+    createTable = "create table udt(id uuid PRIMARY KEY, item frozen<testtype>)"
+
+    insertUdt :: Query Write (UUID,TestType) ()
+    insertUdt = "insert into udt (id,item) values (?,?)"
+
+    selectUdt :: Query Rows () (UUID,TestType)
+    selectUdt = "select id,item from udt"
+
 cassandraTest :: Cas () -> IO ()
 cassandraTest action = do
   pool <- newPool [("127.0.0.1", "9042")] "test" Nothing -- servers, keyspace, auth
@@ -148,7 +196,7 @@ ignoreDropFailure code = code `catch` \exc -> case exc of
     _               -> throw exc
 
 allTests :: TestTree
-allTests = testGroup "All Tests" [tupleTests]
+allTests = testGroup "All Tests" [tupleTests,testUDT]
 
 main :: IO ()
 main = defaultMain allTests

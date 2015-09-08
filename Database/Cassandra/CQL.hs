@@ -130,6 +130,7 @@ module Database.Cassandra.CQL (
         Consistency(..),
         Change(..),
         executeSchema,
+        executeSchemaVoid,
         executeWrite,
         executeRows,
         executeRow,
@@ -153,6 +154,11 @@ module Database.Cassandra.CQL (
         serverStats,
         ServerStat(..),
         PoolConfig(..),
+        -- * Misc for UDTs
+        getOption,
+        putOption,
+        getString,
+        putString
     ) where
 
 import Control.Applicative
@@ -911,6 +917,7 @@ data CType = CCustom Text
            | CMap CType CType
            | CSet CType
            | CMaybe CType
+           | CUDT [CType]
            | CTuple [CType]
         deriving (Eq)
 
@@ -936,6 +943,7 @@ instance Show CType where
         CMap t1 t2 -> "map<"++show t1++","++show t2++">"
         CSet t -> "set<"++show t++">"
         CMaybe t -> "nullable "++show t
+        CUDT ts -> "udt<" ++ (intercalate "," $ fmap show ts) ++ ">"
         CTuple ts -> "tuple<" ++ (intercalate "," $ fmap show ts) ++ ">"
 
 equivalent :: CType -> CType -> Bool
@@ -1193,70 +1201,83 @@ instance (CasType a, Ord a, CasType b) => CasType (Map a b) where
             putByteString bs_b
     casType _ = CMap (casType (undefined :: a)) (casType (undefined :: b))
 
-decodeOption :: CasType a => Get a
-decodeOption = do
+getString :: Get Text
+getString = do
+  len <- getWord16be
+  bs <- getByteString (fromIntegral len)
+  return $ T.decodeUtf8 bs
+
+putString :: Text -> Put
+putString x = do
+  putWord16be (fromIntegral $ B.length val)
+  putByteString val
+  where
+    val = T.encodeUtf8 x
+
+getOption :: CasType a => Get a
+getOption = do
   len <- getWord32be
   bs <- getByteString (fromIntegral len)
   case decodeCas bs of
     Left err -> fail err
     Right x -> return x
 
-encodeOption :: CasType a => a -> Put
-encodeOption x = do
+putOption :: CasType a => a -> Put
+putOption x = do
   let bs = encodeCas x
   putWord32be (fromIntegral $ B.length bs)
   putByteString bs
 
 instance (CasType a, CasType b) => CasType (a,b) where
   getCas = do
-    x <- decodeOption
-    y <- decodeOption
+    x <- getOption
+    y <- getOption
     return (x,y)
   putCas (x,y) = do
-    encodeOption x
-    encodeOption y
+    putOption x
+    putOption y
   casType _ = CTuple [casType (undefined :: a), casType (undefined :: b)]
 
 instance (CasType a, CasType b, CasType c) => CasType(a,b,c) where
   getCas = do
-    x <- decodeOption
-    y <- decodeOption
-    z <- decodeOption
+    x <- getOption
+    y <- getOption
+    z <- getOption
     return (x,y,z)
   putCas (x,y,z) = do
-    encodeOption x
-    encodeOption y
-    encodeOption z
+    putOption x
+    putOption y
+    putOption z
   casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c)]
 
 instance (CasType a,CasType b, CasType c, CasType d) => CasType(a,b,c,d) where
   getCas = do
-    w <- decodeOption
-    x <- decodeOption
-    y <- decodeOption
-    z <- decodeOption
+    w <- getOption
+    x <- getOption
+    y <- getOption
+    z <- getOption
     return (w,x,y,z)
   putCas (w,x,y,z) = do
-    encodeOption w
-    encodeOption x
-    encodeOption y
-    encodeOption z
+    putOption w
+    putOption x
+    putOption y
+    putOption z
   casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c), casType (undefined :: d)]
 
 instance (CasType a,CasType b, CasType c, CasType d, CasType e) => CasType(a,b,c,d,e) where
   getCas = do
-    v <- decodeOption
-    w <- decodeOption
-    x <- decodeOption
-    y <- decodeOption
-    z <- decodeOption
+    v <- getOption
+    w <- getOption
+    x <- getOption
+    y <- getOption
+    z <- getOption
     return (v,w,x,y,z)
   putCas (v,w,x,y,z) = do
-    encodeOption v
-    encodeOption w
-    encodeOption x
-    encodeOption y
-    encodeOption z
+    putOption v
+    putOption w
+    putOption x
+    putOption y
+    putOption z
   casType _ = CTuple [casType (undefined :: a), casType (undefined :: b), casType (undefined :: c), casType (undefined :: d), casType (undefined :: e)]
 
 instance ProtoElt CType where
@@ -1286,8 +1307,17 @@ instance ProtoElt CType where
             0x0020 -> CList <$> getElt
             0x0021 -> CMap <$> getElt <*> getElt
             0x0022 -> CSet <$> getElt
+            0x0030 -> CUDT <$> getEltUdt
             0x0031 -> CTuple <$> getElt
             _      -> fail $ "unknown data type code 0x"++showHex op ""
+
+getEltUdt = do
+  _ <- getString
+  _ <- getString
+  n <- getWord16be
+  replicateM (fromIntegral n) $ do
+    _ <- getString
+    getElt
 
 instance ProtoElt Metadata where
     putElt _ = error "formatting Metadata is not implemented"
@@ -1826,6 +1856,18 @@ executeSchema cons q i = do
     case res of
         SchemaChange ch ks ta -> return (ch, ks, ta)
         _ -> throw $ LocalProtocolError ("expected SchemaChange, but got " `T.append` T.pack (show res)) (queryText q)
+
+-- | Executes a schema change that has a void result such as creating types
+executeSchemaVoid :: (MonadCassandra m, CasValues i) =>
+                 Consistency        -- ^ Consistency level of the operation
+              -> Query Schema i ()  -- ^ CQL query to execute
+              -> i                  -- ^ Input values substituted in the query
+              -> m ()
+executeSchemaVoid cons q i = do
+    res <- executeRaw q i cons
+    case res of
+        Void -> return ()
+        _ -> throw $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | A helper for extracting the types from a metadata definition.
 metadataTypes :: Metadata -> [CType]
