@@ -71,18 +71,18 @@ main = do
         liftIO $ putStrLn ""
         liftIO . print =<< executeRow QUORUM getOneSong u2
 
-        res <- executeTrans updateTimesPlayed (800,u2,799)
+        res <- executeTrans updateTimesPlayed (800,u2,799) QUORUM
         liftIO $ putStrLn $ "Update timesPlayed 799 to 800 : success"
         liftIO . print =<< executeRow QUORUM getOneSong u2
 
-        res <- executeTrans updateTimesPlayed (800,u2,799)
+        res <- executeTrans updateTimesPlayed (800,u2,799) QUORUM
         when (not res) $ liftIO $ putStrLn $ "Update timesPlayed 799 to 800 : failed!"
 
-        res <- executeTrans updateTimesPlayed (801,u2,800)
+        res <- executeTrans updateTimesPlayed (801,u2,800) QUORUM
         liftIO $ putStrLn $ "Update timesPlayed 800 to 801 : success"
         liftIO . print =<< executeRow QUORUM getOneSong u2
 
     where
       insertSongTxn id title artist femaleSinger timesPlayed comment = do
-        res <- executeTrans insertSong (id, title, artist, femaleSinger, timesPlayed, comment)
+        res <- executeTrans insertSong (id, title, artist, femaleSinger, timesPlayed, comment) QUORUM
         when (not res) $ liftIO $ putStrLn $ "Song " ++ show id ++ " already exists."

@@ -1794,14 +1794,14 @@ executeRows cons q i = do
         RowsResult meta rows -> decodeRows q meta rows
         _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
--- | Execute a lightweight transaction. The consistency level is implicit and
--- is SERIAL.
+-- | Execute a lightweight transaction (CAS). 
 executeTrans :: (MonadCassandra m, CasValues i) =>
                 Query Write i () -- ^ CQL query to execute
              -> i                -- ^ Input values substituted in the query
+             -> Consistency      -- ^ Consistency for the write operation (S in CAS).
              -> m Bool
-executeTrans q i = do
-    res <- executeRaw q i SERIAL
+executeTrans q i c = do
+    res <- executeRaw q i c
     case res of
         RowsResult _ ((el:row):rows) ->
           case decodeCas $ fromJust el of
