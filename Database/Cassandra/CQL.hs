@@ -164,8 +164,8 @@ module Database.Cassandra.CQL (
 import Control.Applicative
 import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.STM
-import Control.Exception (IOException, SomeException, MaskingState(..), throwIO, getMaskingState, mask)
-import Control.Monad.CatchIO
+import Control.Exception (IOException, SomeException, MaskingState(..), throwIO, getMaskingState)
+import Control.Monad.Catch
 import Control.Monad.Reader
 import Control.Monad.State hiding (get, put)
 import qualified Control.Monad.RWS
@@ -291,7 +291,7 @@ data ServerStat = ServerStat {
 
 newtype Pool = Pool (PoolState, P.Pool Session)
 
-class MonadCatchIO m => MonadCassandra m where
+class MonadCatch m => MonadCassandra m where
     getCassandraPool :: m Pool
 
 instance MonadCassandra m => MonadCassandra (Control.Monad.Reader.ReaderT a m) where
@@ -592,7 +592,7 @@ timeout' to = timeout (floor $ to * 1000000) >=> maybe (throwIO CoordinatorTimeo
 recvAll :: NominalDiffTime -> Socket -> Int -> IO ByteString
 recvAll ioTimeout s n = timeout' ioTimeout $ do
     bs <- recv s n
-    when (B.null bs) $ throw ShortRead
+    when (B.null bs) $ throwM ShortRead
     let left = n - B.length bs
     if left == 0
         then return bs
@@ -609,17 +609,17 @@ recvFrame qt = do
     ioTimeout <- gets actIoTimeout
     hdrBs <- liftIO $ recvAll ioTimeout s 9
     case runGet parseHeader hdrBs of
-        Left err -> throw $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
+        Left err -> throwM $ LocalProtocolError ("recvFrame: " `T.append` T.pack err) qt
         Right (ver0, flags, stream, opcode, length) -> do
             let ver = ver0 .&. 0x7f
             when (ver /= protocolVersion) $
-                throw $ LocalProtocolError ("unexpected version " `T.append` T.pack (show ver)) qt
+                throwM $ LocalProtocolError ("unexpected version " `T.append` T.pack (show ver)) qt
             body <- if length == 0
                 then pure B.empty
                 else liftIO $ recvAll ioTimeout s (fromIntegral length)
             --liftIO $ putStrLn $ hexdump 0 (C.unpack $ hdrBs `B.append` body)
             return $ Frame flags stream opcode body
-  `catch` \exc -> throw $ CassandraIOException exc
+  `catch` \exc -> throwM $ CassandraIOException exc
   where
     parseHeader = do
         ver <- getWord8
@@ -642,7 +642,7 @@ sendFrame (Frame flags stream opcode body) = do
     s <- gets actSocket
     ioTimeout <- gets actIoTimeout
     liftIO $ timeout' ioTimeout $ sendAll s bs
-  `catch` \exc -> throw $ CassandraIOException exc
+  `catch` \exc -> throwM $ CassandraIOException exc
 
 class ProtoElt a where
     getElt :: Get a
@@ -660,10 +660,10 @@ decodeElt bs = runGet getElt bs
 decodeCas :: CasType a => ByteString -> Either String a
 decodeCas bs = runGet getCas bs
 
-decodeEltM :: (ProtoElt a, MonadIO m) => Text -> ByteString -> Text -> m a
+decodeEltM :: (ProtoElt a, MonadIO m, MonadThrow m) => Text -> ByteString -> Text -> m a
 decodeEltM what bs qt =
     case decodeElt bs of
-        Left err -> throw $ LocalProtocolError
+        Left err -> throwM $ LocalProtocolError
             ("can't parse" `T.append` what `T.append` ": " `T.append` T.pack err) qt
         Right res -> return res
 
@@ -762,11 +762,11 @@ data CassandraCommsError = AuthenticationException Text
 
 instance Exception CassandraCommsError
 
-throwError :: MonadCatchIO m => Text -> ByteString -> m a
+throwError :: MonadCatch m => Text -> ByteString -> m a
 throwError qt bs = do
     case runGet parseError bs of
-        Left err -> throw $ LocalProtocolError ("failed to parse error: " `T.append` T.pack err) qt
-        Right exc -> throw exc
+        Left err -> throwM $ LocalProtocolError ("failed to parse error: " `T.append` T.pack err) qt
+        Right exc -> throwM exc
   where
     parseError :: Get CassandraException
     parseError = do
@@ -814,7 +814,7 @@ authenticate auth = do
   case frOpcode fr2 of
     AUTH_SUCCESS -> return ()
     ERROR -> throwError qt (frBody fr2)
-    op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
+    op -> throwM $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
 introduce :: PoolConfig -> StateT ActiveSession IO ()
 introduce PoolConfig { piKeyspace, piKeyspaceConfig, piAuth }  = do
@@ -823,11 +823,11 @@ introduce PoolConfig { piKeyspace, piKeyspaceConfig, piAuth }  = do
     fr <- recvFrame qt
     case frOpcode fr of
       AUTHENTICATE -> maybe
-        (throw $ MissingAuthenticationError "introduce: server expects auth but none provided" "<credentials>")
+        (throwM $ MissingAuthenticationError "introduce: server expects auth but none provided" "<credentials>")
         authenticate piAuth
       READY -> return ()
       ERROR -> throwError qt (frBody fr)
-      op -> throw $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
+      op -> throwM $ LocalProtocolError ("introduce: unexpected opcode " `T.append` T.pack (show op)) qt
 
     let Keyspace ksName = piKeyspace
 
@@ -838,15 +838,16 @@ introduce PoolConfig { piKeyspace, piKeyspaceConfig, piAuth }  = do
         res <- executeInternal q () QUORUM
         case res of
           SchemaChange _ _ _ -> return ()
-          _ -> throw $ CreateKeyspaceError ("introduce: failed to create a keyspace: " `T.append` T.pack (show res)) (queryText q)
+          _ -> throwM $ CreateKeyspaceError ("introduce: failed to create a keyspace: " `T.append` T.pack (show res)) (queryText q)
 
     let q = query $ "USE " `T.append` ksName :: Query Rows () ()
     res <- executeInternal q () ONE
     case res of
         SetKeyspace ks -> return ()
-        _ -> throw $ LocalProtocolError ("introduce: expected SetKeyspace, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("introduce: expected SetKeyspace, but got " `T.append` T.pack (show res)) (queryText q)
 
-withSession :: MonadCassandra m => (Pool -> StateT ActiveSession IO a) -> m a
+-- TODO Should we have to add the MonadIO constraint?
+withSession :: (MonadCassandra m, MonadIO m) => (Pool -> StateT ActiveSession IO a) -> m a
 withSession code = do
     pool@(Pool (PoolState { psConfig }, sessions)) <- getCassandraPool
 
@@ -1442,9 +1443,9 @@ prepare (Query qid cql) = do
                             let pq = PreparedQuery pqid meta
                             modify $ \act -> act { actQueryCache = M.insert qid pq (actQueryCache act) }
                             return pq
-                        _ -> throw $ LocalProtocolError ("prepare: unexpected result " `T.append` T.pack (show res)) cql
+                        _ -> throwM $ LocalProtocolError ("prepare: unexpected result " `T.append` T.pack (show res)) cql
                 ERROR -> throwError cql (frBody fr)
-                _ -> throw $ LocalProtocolError ("prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) cql
+                _ -> throwM $ LocalProtocolError ("prepare: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) cql
 
 data CodingFailure = Mismatch Int CType CType
                    | WrongNumber Int Int
@@ -1753,7 +1754,8 @@ instance ProtoElt Consistency where
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
 -- | A low-level function in case you need some rarely-used capabilities.
-executeRaw :: (MonadCassandra m, CasValues i) =>
+-- TODO Should we have to add the MonadIO constraint?
+executeRaw :: (MonadIO m, MonadCassandra m, CasValues i) =>
               Query style any_i any_o -> i -> Consistency -> m (Result [Maybe ByteString])
 executeRaw query i cons = withSession (\_ -> executeInternal query i cons)
 
@@ -1762,7 +1764,7 @@ executeInternal :: CasValues values =>
 executeInternal query i cons = do
     (PreparedQuery pqid queryMeta) <- prepare query
     values <- case encodeValues i (metadataTypes queryMeta) of
-        Left err -> throw $ ValueMarshallingException TransportSending (T.pack $ show err) (queryText query)
+        Left err -> throwM $ ValueMarshallingException TransportSending (T.pack $ show err) (queryText query)
         Right values -> return values
     sendFrame $ Frame [] 0 EXECUTE $ runPut $ do
         putElt pqid
@@ -1780,10 +1782,14 @@ executeInternal query i cons = do
     case frOpcode fr of
         RESULT -> decodeEltM "RESULT" (frBody fr) (queryText query)
         ERROR -> throwError (queryText query) (frBody fr)
-        _ -> throw $ LocalProtocolError ("execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) (queryText query)
+        _ -> throwM $ LocalProtocolError ("execute: unexpected opcode " `T.append` T.pack (show (frOpcode fr))) (queryText query)
+
+
+-- executeInternalTxt :: Text ->
 
 -- | Execute a query that returns rows.
-executeRows :: (MonadCassandra m, CasValues i, CasValues o) =>
+-- TODO Should we have to add the MonadIO constraint?
+executeRows :: (MonadCassandra m, MonadIO m, CasValues i, CasValues o) =>
                Consistency     -- ^ Consistency level of the operation
             -> Query Rows i o  -- ^ CQL query to execute
             -> i               -- ^ Input values substituted in the query
@@ -1792,10 +1798,25 @@ executeRows cons q i = do
     res <- executeRaw q i cons
     case res of
         RowsResult meta rows -> decodeRows q meta rows
-        _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+
+-- | Execute a query that returns a Frames record
+executeRowsFrames :: (MonadCassandra m, MonadIO m, CasValues i, CasValues o) =>
+               Consistency     -- ^ Consistency level of the operation
+            -> Query Rows i o  -- ^ CQL query to execute
+            -> i               -- ^ Input values substituted in the query
+            -> m [o]
+executeRowsFrames cons q i = do
+    res <- executeRaw q i cons
+    case res of
+        RowsResult meta bytestringRows -> do
+            let txtRows = fmap (fmap T.decodeUtf8) <$> bytestringRows
+            undefined
+        _ -> throwM $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+
 
 -- | Execute a lightweight transaction (CAS). 
-executeTrans :: (MonadCassandra m, CasValues i) =>
+executeTrans :: (MonadIO m, MonadCassandra m, CasValues i) =>
                 Query Write i () -- ^ CQL query to execute
              -> i                -- ^ Input values substituted in the query
              -> Consistency      -- ^ Consistency for the write operation (S in CAS).
@@ -1807,11 +1828,11 @@ executeTrans q i c = do
           case decodeCas $ fromJust el of
             Left s -> error $ "executeTrans: decode result failure=" ++ s
             Right b -> return b
-        _ -> throw $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Helper for 'executeRows' useful in situations where you are only expecting one row
 -- to be returned.
-executeRow :: (MonadCassandra m, CasValues i, CasValues o) =>
+executeRow :: (MonadIO m, MonadCassandra m, CasValues i, CasValues o) =>
               Consistency     -- ^ Consistency level of the operation
            -> Query Rows i o  -- ^ CQL query to execute
            -> i               -- ^ Input values substituted in the query
@@ -1820,17 +1841,17 @@ executeRow cons q i = do
     rows <- executeRows cons q i
     return $ listToMaybe rows
 
-decodeRows :: (MonadCatchIO m, CasValues values) => Query Rows any_i values -> Metadata -> [[Maybe ByteString]] -> m [values]
+decodeRows :: (MonadCatch m, CasValues values) => Query Rows any_i values -> Metadata -> [[Maybe ByteString]] -> m [values]
 decodeRows query meta rows0 = do
     let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
     case lefts rows1 of
-        (err:_) -> throw $ ValueMarshallingException TransportReceiving (T.pack $ show err) (queryText query)
+        (err:_) -> throwM $ ValueMarshallingException TransportReceiving (T.pack $ show err) (queryText query)
         [] -> return ()
     let rows2 = flip map rows1 $ \(Right v) -> v
     return $ rows2
 
 -- | Execute a write operation that returns void.
-executeWrite :: (MonadCassandra m, CasValues i) =>
+executeWrite :: (MonadIO m, MonadCassandra m, CasValues i) =>
                 Consistency       -- ^ Consistency level of the operation
              -> Query Write i ()  -- ^ CQL query to execute
              -> i                 -- ^ Input values substituted in the query
@@ -1839,10 +1860,10 @@ executeWrite cons q i = do
     res <- executeRaw q i cons
     case res of
         Void -> return ()
-        _ -> throw $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Execute a schema change, such as creating or dropping a table.
-executeSchema :: (MonadCassandra m, CasValues i) =>
+executeSchema :: (MonadIO m, MonadCassandra m, CasValues i) =>
                  Consistency        -- ^ Consistency level of the operation
               -> Query Schema i ()  -- ^ CQL query to execute
               -> i                  -- ^ Input values substituted in the query
@@ -1851,10 +1872,10 @@ executeSchema cons q i = do
     res <- executeRaw q i cons
     case res of
         SchemaChange ch ks ta -> return (ch, ks, ta)
-        _ -> throw $ LocalProtocolError ("expected SchemaChange, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("expected SchemaChange, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | Executes a schema change that has a void result such as creating types
-executeSchemaVoid :: (MonadCassandra m, CasValues i) =>
+executeSchemaVoid :: (MonadIO m, MonadCassandra m, CasValues i) =>
                  Consistency        -- ^ Consistency level of the operation
               -> Query Schema i ()  -- ^ CQL query to execute
               -> i                  -- ^ Input values substituted in the query
@@ -1863,7 +1884,7 @@ executeSchemaVoid cons q i = do
     res <- executeRaw q i cons
     case res of
         Void -> return ()
-        _ -> throw $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
+        _ -> throwM $ LocalProtocolError ("expected Void, but got " `T.append` T.pack (show res)) (queryText q)
 
 -- | A helper for extracting the types from a metadata definition.
 metadataTypes :: Metadata -> [CType]
@@ -1871,7 +1892,7 @@ metadataTypes (Metadata colspecs) = map (\(ColumnSpec _ _ typ) -> typ) colspecs
 
 -- | The monad used to run Cassandra queries in.
 newtype Cas a = Cas (ReaderT Pool IO a)
-    deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
+    deriving (Functor, Applicative, Monad, MonadIO, MonadCatch, MonadThrow)
 
 instance MonadCassandra Cas where
     getCassandraPool = Cas ask
