@@ -213,6 +213,8 @@ import Data.Fixed (Pico)
 import System.Timeout (timeout)
 import System.Log.Logger (debugM, warningM)
 
+import Debug.Trace
+
 defaultConnectionTimeout :: NominalDiffTime
 defaultConnectionTimeout = 10
 
@@ -1496,6 +1498,42 @@ instance (CasType a, CasNested rem) => CasNested (a, rem) where
 class CasValues v where
     encodeValues :: v -> [CType] -> Either CodingFailure [Maybe ByteString]
     decodeValues :: [(CType, Maybe ByteString)] -> Either CodingFailure v
+{-
+
+TODO this is the place where values get made
+
+To make it for a custom type you'd need to generate CasValues instances... for instance for Songs, whose type is:
+
+Songs
+  :: Data.Text.Internal.Text
+     -> Data.Text.Internal.Text
+     -> Bool
+     -> uuid-types-1.0.3:Data.UUID.Types.Internal.UUID
+     -> Int
+     -> Data.Text.Internal.Text
+     -> Songs
+
+The CasValue instance for Songs should look like:
+
+instance CasValues Songs where
+    decodeValues vs = do
+        let (a, b, c, d, e, f) = vs
+        Songs <$> a <*> b <*> c <*> d <*> e <*> f
+
+How will you apply the CasValues to what's inside of vs though? Won't
+that be necessary?
+
+Here is the original instance for 6 values:
+
+instance (CasType a, CasType b, CasType c, CasType d, CasType e,
+          CasType f) => CasValues (a, b, c, d, e, f) where
+    encodeValues (a, b, c, d, e, f) =
+        encodeNested 0 (a, (b, (c, (d, (e, (f, ()))))))
+    decodeValues vs = (\(a, (b, (c, (d, (e, (f, ())))))) ->
+        (a, b, c, d, e, f)) <$> decodeNested 0 vs
+
+
+-}
 
 instance CasValues () where
     encodeValues () types = encodeNested 0 () types
@@ -1753,6 +1791,28 @@ instance ProtoElt Consistency where
             0x000A -> pure LOCAL_ONE
             _      -> fail $ "unknown consistency value 0x"++showHex w ""
 
+
+-- TODO can I make some function that uses results of executeRaw and allows user to provide typeclasses (including typeclasses based on their custom type) to parse it?
+
+f :: Result [Maybe ByteString] -> [ByteString]
+f = undefined
+
+class Decodeable a where
+  mydecode ::  [ByteString] -> m a
+
+-- execute2 :: (MonadIO m,MonadCassandra m, CasValues i) => Query style any_i any_o -> i -> Consistency -> m a
+-- execute2 query i cons = do
+--   res <- withSession (\_ -> executeInternal query i cons)
+--   mydecode $ f res
+
+data MyType = MyType {x :: Int}
+
+g :: ByteString -> Maybe Int
+g  = undefined
+
+-- instance Decodeable MyType where
+--   mydecode bs = MyType <$> g (bs !! 0)
+
 -- | A low-level function in case you need some rarely-used capabilities.
 -- TODO Should we have to add the MonadIO constraint?
 executeRaw :: (MonadIO m, MonadCassandra m, CasValues i) =>
@@ -1800,6 +1860,20 @@ executeRows cons q i = do
         RowsResult meta rows -> decodeRows q meta rows
         _ -> throwM $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
 
+
+-- executeRows' :: (MonadCassandra m, MonadIO m, CasValues i, CasValues o) =>
+--                 Consistency     -- ^ Consistency level of the operation
+--              -> Query Rows i o  -- ^ CQL query to execute
+--              -> a               -- ^ Input values substituted in the query
+--              -> m [a]
+-- executeRows' cons q i = do
+--     res <- executeRaw q i cons
+--     case res of
+--         RowsResult meta rows -> decodeRows q meta rows
+--         _ -> throwM $ LocalProtocolError ("expected Rows, but got " `T.append` T.pack (show res)) (queryText q)
+
+
+
 -- | Execute a query that returns a Frames record
 executeRowsFrames :: (MonadCassandra m, MonadIO m, CasValues i, CasValues o) =>
                Consistency     -- ^ Consistency level of the operation
@@ -1841,9 +1915,29 @@ executeRow cons q i = do
     rows <- executeRows cons q i
     return $ listToMaybe rows
 
+getOneSong :: Query 'Rows UUID (Text, Int)
+getOneSong = "select artist, timesPlayed from songs where id=?"
+
+
+-- exMetadata = Metadata [ColumnSpec (TableSpec (Keyspace "test1") (Table "songs")) "artist" text,ColumnSpec (TableSpec (Keyspace "test1") (Table "songs")) "timesplayed" int]
+exMetadata = Metadata [ColumnSpec (TableSpec (Keyspace "test1") (Table "songs")) "artist" CText,ColumnSpec (TableSpec (Keyspace "test1") (Table "songs")) "timesplayed" CInt]
+
+exRows0 :: [[Maybe B.ByteString]]
+exRows0 = [[Just "Evanescence",Just "\NUL\NUL\ETX\US"]]
+
+-- decodeRows getSongs exMetadata 
+{-
+ Using example values:
+
+λ> decodeRows getOneSong exMetadata exRows0
+[("Evanescence",799)]
+-}
+
 decodeRows :: (MonadCatch m, CasValues values) => Query Rows any_i values -> Metadata -> [[Maybe ByteString]] -> m [values]
 decodeRows query meta rows0 = do
-    let rows1 = flip map rows0 $ \cols -> decodeValues (zip (metadataTypes meta) cols)
+    let meta' = trace ("meta: " ++ show meta) meta
+    let rows0' = trace ("rows0: " ++ show rows0) rows0
+    let rows1 = flip map rows0' $ \cols -> decodeValues (zip (metadataTypes meta') cols)
     case lefts rows1 of
         (err:_) -> throwM $ ValueMarshallingException TransportReceiving (T.pack $ show err) (queryText query)
         [] -> return ()
