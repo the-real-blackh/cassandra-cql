@@ -7,11 +7,11 @@
 --
 -- Here's the correspondence between CQL and Haskell types:
 --
--- * ascii - 'ByteString'
+-- * ascii - 'Ascii' (newtype of 'ByteString')
 --
 -- * bigint - 'Int64'
 --
--- * blob - 'Blob'
+-- * blob - 'ByteString'
 --
 -- * boolean - 'Bool'
 --
@@ -136,7 +136,7 @@ module Database.Cassandra.CQL (
         executeRow,
         executeTrans,
         -- * Value types
-        Blob(..),
+        Ascii(..),
         Counter(..),
         TimeUUID(..),
         metadataTypes,
@@ -1006,9 +1006,16 @@ instance CasType a => CasType (Maybe a) where
     casObliterate (Just a) bs = Just bs
     casObliterate Nothing  _  = Nothing
 
-instance CasType ByteString where
-    getCas = getByteString =<< remaining
-    putCas = putByteString
+-- | If you wrap this round a 'ByteString', it will be treated as an
+-- /ascii/ type instead of /blob/ (if it was a plain 'ByteString'
+-- type). Note that the bytes must indeed be in the range of ASCII.
+-- This is your responsibility when constructing this newtype.
+newtype Ascii = Ascii { unAscii :: ByteString }
+    deriving (Eq, Ord, Show)
+
+instance CasType Ascii where
+    getCas = Ascii <$> (getByteString =<< remaining)
+    putCas = putByteString . unAscii
     casType _ = CAscii
 
 instance CasType Int64 where
@@ -1016,14 +1023,9 @@ instance CasType Int64 where
     putCas = putWord64be . fromIntegral
     casType _ = CBigint
 
--- | If you wrap this round a 'ByteString', it will be treated as a /blob/ type
--- instead of /ascii/ (if it was a plain 'ByteString' type).
-newtype Blob = Blob { unBlob :: ByteString }
-    deriving (Eq, Ord, Show)
-
-instance CasType Blob where
-    getCas = Blob <$> (getByteString =<< remaining)
-    putCas (Blob bs) = putByteString bs
+instance CasType ByteString where
+    getCas = getByteString =<< remaining
+    putCas bs = putByteString bs
     casType _ = CBlob
 
 instance CasType Bool where

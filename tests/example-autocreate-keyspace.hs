@@ -4,6 +4,7 @@ import Database.Cassandra.CQL
 import Control.Monad
 import Control.Monad.CatchIO
 import Control.Monad.Trans (liftIO)
+import qualified Data.ByteString as B
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as C
 import Data.Text (Text)
@@ -15,13 +16,13 @@ dropSongs :: Query Schema () ()
 dropSongs = "drop table songs"
 
 createSongs :: Query Schema () ()
-createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist varchar, femaleSinger boolean, timesPlayed int, comment text)"
+createSongs = "create table songs (id uuid PRIMARY KEY, title ascii, artist varchar, femaleSinger boolean, timesPlayed int, comment text, recording blob)"
 
-insertSong :: Query Write (UUID, ByteString, Text, Bool, Int, Maybe Text) ()
-insertSong = "insert into songs (id, title, artist, femaleSinger, timesPlayed, comment) values (?, ?, ?, ?, ?, ?)"
+insertSong :: Query Write (UUID, Ascii, Text, Bool, Int, Maybe Text, ByteString) ()
+insertSong = "insert into songs (id, title, artist, femaleSinger, timesPlayed, comment, recording) values (?, ?, ?, ?, ?, ?, ?)"
 
-getSongs :: Query Rows () (UUID, ByteString, Text, Bool, Int, Maybe Text)
-getSongs = "select id, title, artist, femaleSinger, timesPlayed, comment from songs"
+getSongs :: Query Rows () (UUID, Ascii, Text, Bool, Int, Maybe Text, ByteString)
+getSongs = "select id, title, artist, femaleSinger, timesPlayed, comment, recording from songs"
 
 getOneSong :: Query Rows UUID (Text, Int)
 getOneSong = "select artist, timesPlayed from songs where id=?"
@@ -50,19 +51,20 @@ main = do
         u1 <- liftIO randomIO
         u2 <- liftIO randomIO
         u3 <- liftIO randomIO
-        executeWrite QUORUM insertSong (u1, "La Grange", "ZZ Top", False, 2, Nothing)
-        executeWrite QUORUM insertSong (u2, "Your Star", "Evanescence", True, 799, Nothing)
-        executeWrite QUORUM insertSong (u3, "Angel of Death", "Slayer", False, 50, Just "Singer Tom Araya")
+        executeWrite QUORUM insertSong (u1, Ascii "La Grange", "ZZ Top", False, 2, Nothing, B.pack [minBound .. maxBound])
+        executeWrite QUORUM insertSong (u2, Ascii "Your Star", "Evanescence", True, 799, Nothing, B.pack [maxBound, (maxBound-2) .. minBound])
+        executeWrite QUORUM insertSong (u3, Ascii "Angel of Death", "Slayer", False, 50, Just "Singer Tom Araya", mempty)
 
         songs <- executeRows QUORUM getSongs ()
-        liftIO $ forM_ songs $ \(uuid, title, artist, female, played, mComment) -> do
+        liftIO $ forM_ songs $ \(uuid, title, artist, female, played, mComment, recording) -> do
             putStrLn ""
             putStrLn $ "id            : "++show uuid
-            putStrLn $ "title         : "++C.unpack title
+            putStrLn $ "title         : "++C.unpack (unAscii title)
             putStrLn $ "artist        : "++T.unpack artist
             putStrLn $ "female singer : "++show female
             putStrLn $ "times played  : "++show played
             putStrLn $ "comment       : "++show mComment
+            putStrLn $ "recording sz. : "++show (B.length recording)
 
         liftIO $ putStrLn ""
         liftIO . print =<< executeRow QUORUM getOneSong u2
