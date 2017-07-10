@@ -4,3 +4,5 @@
 dist/
 cabal.sandbox.config
 .cabal-sandbox/
+dist-newstyle/
+cabal.project.local
