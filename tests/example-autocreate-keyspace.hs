@@ -2,7 +2,7 @@
 
 import Database.Cassandra.CQL
 import Control.Monad
-import Control.Monad.CatchIO
+import Control.Monad.Catch
 import Control.Monad.Trans (liftIO)
 import qualified Data.ByteString as B
 import Data.ByteString.Char8 (ByteString)
@@ -31,7 +31,7 @@ ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
     ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
     Invalid _ _ -> return ()
-    _               -> throw exc
+    _               -> throwM exc
 
 main = do
     -- let auth = Just (PasswordAuthenticator "cassandra" "cassandra")

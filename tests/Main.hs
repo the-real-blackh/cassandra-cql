@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, DataKinds #-}
 
-import Control.Monad.CatchIO
+import Control.Monad.Catch
 import Control.Monad.Trans (liftIO)
 import Data.Int
 import qualified Data.List as L
@@ -229,7 +229,7 @@ ignoreDropFailure :: Cas () -> Cas ()
 ignoreDropFailure code = code `catch` \exc -> case exc of
     ConfigError _ _ -> return ()  -- Ignore the error if the table doesn't exist
     Invalid _ _ -> return ()
-    _               -> throw exc
+    _               -> throwM exc
 
 allTests :: TestTree
 allTests = testGroup "All Tests" [tupleTests,testUDT, testMap]
